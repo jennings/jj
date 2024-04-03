@@ -260,6 +260,20 @@ directory.
 
 We hope to integrate with Gerrit natively in the future.
 
+### How do I move the user configuration file?
+
+There are two options for changing where the user configuration file is read
+from:
+
+1. Set the `JJ_CONFIG` environment variable to a file or directory.
+
+2. Create a symlink from the platform-dependent directory to the desired path.
+   For example, to read configuration from `~/.config/jj` on macOS:
+
+   ```shell
+   $ ln -s ../../.config/jj ~/Library/Application\ Support/jj
+   ```
+
 [branches_conflicts]: branches.md#conflicts
 
 [change ID]: glossary.md#change-id

@@ -1005,6 +1005,10 @@ default locations. For example,
 env JJ_CONFIG=/dev/null jj log       # Ignores any settings specified in the config file.
 ```
 
+If `JJ_CONFIG` contains the path of a directory, all files in that directory
+will be used for configuration. Files are read in lexicographic order, so
+settings in `b.toml` would override settings in `a.toml`.
+
 ### Specifying config on the command-line
 
 You can use one or more `--config-toml` options on the command line to specify
