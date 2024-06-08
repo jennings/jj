@@ -201,6 +201,7 @@ fn test_bad_function_call() {
       |         ^------^
       |
       = Function "whatever" doesn't exist
+    Hint: Did you mean "date"?
     "###);
 
     let stderr = test_env.jj_cmd_failure(
@@ -290,7 +291,7 @@ fn test_function_name_hint() {
       | ^-----^
       |
       = Function "author_" doesn't exist
-    Hint: Did you mean "author", "my_author"?
+    Hint: Did you mean "author", "author_date", "my_author"?
     "###);
 
     insta::assert_snapshot!(evaluate_err("my_branches"), @r###"

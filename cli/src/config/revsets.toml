@@ -21,3 +21,5 @@ latest(
 'immutable_heads()' = 'trunk() | tags()'
 'immutable()' = '::(immutable_heads() | root())'
 'mutable()' = '~immutable()'
+
+'date(d)' = 'committer_date(d)'
