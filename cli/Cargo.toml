@@ -69,6 +69,7 @@ indoc = { workspace = true }
 itertools = { workspace = true }
 jj-lib = { workspace = true }
 maplit = { workspace = true }
+mlua = { workspace = true }
 once_cell = { workspace = true }
 os_pipe = { workspace = true }
 pest = { workspace = true }
