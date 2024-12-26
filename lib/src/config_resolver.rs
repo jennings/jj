@@ -42,6 +42,14 @@ pub struct ConfigResolutionContext<'a> {
     pub repo_path: Option<&'a Path>,
 }
 
+#[derive(serde::Deserialize, Copy, Clone, Debug, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OsFamily {
+    Unix,
+    MacOS,
+    Windows,
+}
+
 /// Conditions to enable the parent table.
 ///
 /// - Each predicate is tested separately, and the results are intersected.
@@ -54,6 +62,8 @@ pub struct ConfigResolutionContext<'a> {
 struct ScopeCondition {
     /// Paths to match the repository path prefix.
     pub repositories: Option<Vec<PathBuf>>,
+    /// Platforms to match.
+    pub os_families: Option<Vec<OsFamily>>,
     // TODO: maybe add "workspaces"?
 }
 
@@ -81,6 +91,7 @@ impl ScopeCondition {
 
     fn matches(&self, context: &ConfigResolutionContext) -> bool {
         matches_path_prefix(self.repositories.as_deref(), context.repo_path)
+            && matches_os_family(self.os_families.as_deref())
     }
 }
 
@@ -100,6 +111,21 @@ fn matches_path_prefix(candidates: Option<&[PathBuf]>, actual: Option<&Path>) ->
         (Some(_), None) => false, // actual path not known (e.g. not in workspace)
         (None, _) => true,        // no constraints
     }
+}
+
+#[cfg(windows)]
+fn matches_os_family(candidates: Option<&[OsFamily]>) -> bool {
+    candidates.map_or(true, |os| os.contains(&OsFamily::Windows))
+}
+
+#[cfg(target_os = "macos")]
+fn matches_os_family(candidates: Option<&[OsFamily]>) -> bool {
+    candidates.map_or(true, |os| os.contains(&OsFamily::MacOS))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn matches_os_family(candidates: Option<&[OsFamily]>) -> bool {
+    candidates.map_or(true, |os| os.contains(&OsFamily::Unix))
 }
 
 /// Evaluates condition for each layer and scope, flattens scoped tables.
@@ -220,6 +246,7 @@ mod tests {
     fn test_condition_repo_path() {
         let condition = ScopeCondition {
             repositories: Some(["/foo", "/bar"].map(PathBuf::from).into()),
+            os_families: None,
         };
 
         let context = ConfigResolutionContext {
@@ -253,6 +280,7 @@ mod tests {
     fn test_condition_repo_path_windows() {
         let condition = ScopeCondition {
             repositories: Some(["c:/foo", r"d:\bar/baz"].map(PathBuf::from).into()),
+            os_families: None,
         };
 
         let context = ConfigResolutionContext {
@@ -396,6 +424,38 @@ mod tests {
         assert_eq!(resolved_config.layers().len(), 2);
         insta::assert_snapshot!(resolved_config.layers()[0].data, @"a = 'a #0'");
         insta::assert_snapshot!(resolved_config.layers()[1].data, @"a = 'a #1 baz'");
+    }
+
+    #[test]
+    fn test_resolve_os_family() {
+        let mut source_config = StackedConfig::empty();
+        source_config.add_layer(new_user_layer(indoc! {"
+            a = 'root'
+            [[--scope]]
+            --when.os-families = ['unix']
+            a = 'unix'
+            [[--scope]]
+            --when.os-families = ['macos']
+            a = 'macos'
+            [[--scope]]
+            --when.os-families = ['windows']
+            a = 'windows'
+        "}));
+
+        let context = ConfigResolutionContext {
+            home_dir: Some(Path::new("/home/dir")),
+            repo_path: None,
+        };
+        let resolved_config = resolve(&source_config, &context).unwrap();
+        assert_eq!(resolved_config.layers().len(), 2);
+        insta::assert_snapshot!(resolved_config.layers()[0].data, @"a = 'root'");
+        if cfg!(windows) {
+            insta::assert_snapshot!(resolved_config.layers()[1].data, @"a = 'windows'");
+        } else if cfg!(target_os = "macos") {
+            insta::assert_snapshot!(resolved_config.layers()[1].data, @"a = 'macos'");
+        } else {
+            insta::assert_snapshot!(resolved_config.layers()[1].data, @"a = 'unix'");
+        }
     }
 
     #[test]
