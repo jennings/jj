@@ -800,18 +800,22 @@ impl EvaluationContext<'_> {
             ResolvedExpression::Commits(commit_ids) => {
                 Ok(Box::new(self.revset_for_commit_ids(commit_ids)?))
             }
-            ResolvedExpression::Ancestors { heads, generation } => {
+            ResolvedExpression::Ancestors {
+                heads,
+                generation,
+                first_parents_only,
+            } => {
                 let head_set = self.evaluate(heads)?;
                 let head_positions = head_set.positions().attach(index);
                 let builder =
                     RevWalkBuilder::new(index).wanted_heads(head_positions.try_collect()?);
                 if generation == &GENERATION_RANGE_FULL {
-                    let walk = builder.ancestors().detach();
+                    let walk = builder.ancestors_with_first_parents(*first_parents_only).detach();
                     Ok(Box::new(RevWalkRevset { walk }))
                 } else {
                     let generation = to_u32_generation_range(generation)?;
                     let walk = builder
-                        .ancestors_filtered_by_generation(generation)
+                        .ancestors_filtered_by_generation(generation, *first_parents_only)
                         .detach();
                     Ok(Box::new(RevWalkRevset { walk }))
                 }
@@ -842,7 +846,7 @@ impl EvaluationContext<'_> {
                 } else {
                     let generation = to_u32_generation_range(generation)?;
                     let walk = builder
-                        .ancestors_filtered_by_generation(generation)
+                        .ancestors_filtered_by_generation(generation, false)
                         .detach();
                     Ok(Box::new(RevWalkRevset { walk }))
                 }

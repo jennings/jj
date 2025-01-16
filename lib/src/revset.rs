@@ -233,6 +233,7 @@ pub enum RevsetExpression<St: ExpressionState> {
     Ancestors {
         heads: Rc<Self>,
         generation: Range<u64>,
+        first_parents_only: bool,
     },
     Descendants {
         roots: Rc<Self>,
@@ -390,25 +391,34 @@ impl<St: ExpressionState> RevsetExpression<St> {
 
     /// Parents of `self`.
     pub fn parents(self: &Rc<Self>) -> Rc<Self> {
-        self.ancestors_at(1)
+        self.ancestors_at(1, false)
     }
 
     /// Ancestors of `self`, including `self`.
     pub fn ancestors(self: &Rc<Self>) -> Rc<Self> {
-        self.ancestors_range(GENERATION_RANGE_FULL)
+        self.ancestors_range(GENERATION_RANGE_FULL, false)
+    }
+
+    pub fn ancestors_with_first_parents(self: &Rc<Self>, first_parents_only: bool) -> Rc<Self> {
+        self.ancestors_range(GENERATION_RANGE_FULL, first_parents_only)
     }
 
     /// Ancestors of `self` at an offset of `generation` behind `self`.
     /// The `generation` offset is zero-based starting from `self`.
-    pub fn ancestors_at(self: &Rc<Self>, generation: u64) -> Rc<Self> {
-        self.ancestors_range(generation..(generation + 1))
+    pub fn ancestors_at(self: &Rc<Self>, generation: u64, first_parents_only: bool) -> Rc<Self> {
+        self.ancestors_range(generation..(generation + 1), first_parents_only)
     }
 
     /// Ancestors of `self` in the given range.
-    pub fn ancestors_range(self: &Rc<Self>, generation_range: Range<u64>) -> Rc<Self> {
+    pub fn ancestors_range(
+        self: &Rc<Self>,
+        generation_range: Range<u64>,
+        first_parents_only: bool,
+    ) -> Rc<Self> {
         Rc::new(Self::Ancestors {
             heads: self.clone(),
             generation: generation_range,
+            first_parents_only,
         })
     }
 
@@ -609,6 +619,7 @@ pub enum ResolvedExpression {
     Ancestors {
         heads: Box<Self>,
         generation: Range<u64>,
+        first_parents_only: bool,
     },
     /// Commits that are ancestors of `heads` but not ancestors of `roots`.
     Range {
@@ -667,7 +678,8 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
         Ok(expression.children())
     });
     map.insert("ancestors", |diagnostics, function, context| {
-        let ([heads_arg], [depth_opt_arg]) = function.expect_arguments()?;
+        let ([heads_arg], [depth_opt_arg, first_parents_opt_arg]) =
+            function.expect_named_arguments(&["", "first-parent"])?;
         let heads = lower_expression(diagnostics, heads_arg, context)?;
         let generation = if let Some(depth_arg) = depth_opt_arg {
             let depth = expect_literal(diagnostics, "integer", depth_arg)?;
@@ -675,7 +687,12 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
         } else {
             GENERATION_RANGE_FULL
         };
-        Ok(heads.ancestors_range(generation))
+        let first_parents_only = if let Some(first_parents_arg) = first_parents_opt_arg {
+            expect_literal(diagnostics, "boolean", first_parents_arg)?
+        } else {
+            false
+        };
+        Ok(heads.ancestors_range(generation, first_parents_only))
     });
     map.insert("descendants", |diagnostics, function, context| {
         let ([roots_arg], [depth_opt_arg]) = function.expect_arguments()?;
@@ -1200,11 +1217,15 @@ fn try_transform_expression<St: ExpressionState, E>(
             RevsetExpression::Root => None,
             RevsetExpression::Commits(_) => None,
             RevsetExpression::CommitRef(_) => None,
-            RevsetExpression::Ancestors { heads, generation } => transform_rec(heads, pre, post)?
-                .map(|heads| RevsetExpression::Ancestors {
-                    heads,
-                    generation: generation.clone(),
-                }),
+            RevsetExpression::Ancestors {
+                heads,
+                generation,
+                first_parents_only,
+            } => transform_rec(heads, pre, post)?.map(|heads| RevsetExpression::Ancestors {
+                heads,
+                generation: generation.clone(),
+                first_parents_only: *first_parents_only,
+            }),
             RevsetExpression::Descendants { roots, generation } => transform_rec(roots, pre, post)?
                 .map(|roots| RevsetExpression::Descendants {
                     roots,
@@ -1385,10 +1406,19 @@ where
         RevsetExpression::Root => RevsetExpression::Root.into(),
         RevsetExpression::Commits(ids) => RevsetExpression::Commits(ids.clone()).into(),
         RevsetExpression::CommitRef(commit_ref) => folder.fold_commit_ref(commit_ref)?,
-        RevsetExpression::Ancestors { heads, generation } => {
+        RevsetExpression::Ancestors {
+            heads,
+            generation,
+            first_parents_only,
+        } => {
             let heads = folder.fold_expression(heads)?;
             let generation = generation.clone();
-            RevsetExpression::Ancestors { heads, generation }.into()
+            RevsetExpression::Ancestors {
+                heads,
+                generation,
+                first_parents_only: *first_parents_only,
+            }
+            .into()
         }
         RevsetExpression::Descendants { roots, generation } => {
             let roots = folder.fold_expression(roots)?;
@@ -1602,10 +1632,11 @@ fn to_difference_range<St: ExpressionState>(
     match (expression.as_ref(), complement.as_ref()) {
         // ::heads & ~(::roots) -> roots..heads
         (
-            RevsetExpression::Ancestors { heads, generation },
+            RevsetExpression::Ancestors { heads, generation, first_parents_only: false },
             RevsetExpression::Ancestors {
                 heads: roots,
                 generation: GENERATION_RANGE_FULL,
+                first_parents_only: false,
             },
         ) => Some(Rc::new(RevsetExpression::Range {
             roots: roots.clone(),
@@ -1614,7 +1645,7 @@ fn to_difference_range<St: ExpressionState>(
         })),
         // ::heads & ~(::roots-) -> ::heads & ~ancestors(roots, 1..) -> roots-..heads
         (
-            RevsetExpression::Ancestors { heads, generation },
+            RevsetExpression::Ancestors { heads, generation, first_parents_only: false },
             RevsetExpression::Ancestors {
                 heads: roots,
                 generation:
@@ -1622,9 +1653,10 @@ fn to_difference_range<St: ExpressionState>(
                         start: roots_start,
                         end: u64::MAX,
                     },
+                    first_parents_only: false,
             },
         ) => Some(Rc::new(RevsetExpression::Range {
-            roots: roots.ancestors_at(*roots_start),
+            roots: roots.ancestors_at(*roots_start, false),
             heads: heads.clone(),
             generation: generation.clone(),
         })),
@@ -1698,6 +1730,7 @@ fn unfold_difference<St: ExpressionState>(
             let heads_ancestors = Rc::new(RevsetExpression::Ancestors {
                 heads: heads.clone(),
                 generation: generation.clone(),
+                first_parents_only: false,
             });
             Some(heads_ancestors.intersection(&roots.ancestors().negated()))
         }
@@ -2277,9 +2310,14 @@ impl VisibilityResolutionContext<'_> {
                 ResolvedExpression::Commits(commit_ids.clone())
             }
             RevsetExpression::CommitRef(commit_ref) => match *commit_ref {},
-            RevsetExpression::Ancestors { heads, generation } => ResolvedExpression::Ancestors {
+            RevsetExpression::Ancestors {
+                heads,
+                generation,
+                first_parents_only,
+            } => ResolvedExpression::Ancestors {
                 heads: self.resolve(heads).into(),
                 generation: generation.clone(),
+                first_parents_only: *first_parents_only,
             },
             RevsetExpression::Descendants { roots, generation } => ResolvedExpression::DagRange {
                 roots: self.resolve(roots).into(),
@@ -2384,6 +2422,7 @@ impl VisibilityResolutionContext<'_> {
         ResolvedExpression::Ancestors {
             heads: self.resolve_visible_heads().into(),
             generation: GENERATION_RANGE_FULL,
+            first_parents_only: false,
         }
     }
 

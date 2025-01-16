@@ -418,17 +418,28 @@ impl<'a> RevWalkBuilder<'a> {
 
     /// Walks ancestors.
     pub fn ancestors(self) -> RevWalkAncestors<'a> {
-        self.ancestors_with_min_pos(IndexPosition::MIN)
+        self.ancestors_with_min_pos(IndexPosition::MIN, false)
     }
 
-    fn ancestors_with_min_pos(self, min_pos: IndexPosition) -> RevWalkAncestors<'a> {
+    pub fn ancestors_with_first_parents(self, first_parents_only: bool) -> RevWalkAncestors<'a> {
+        self.ancestors_with_min_pos(IndexPosition::MIN, first_parents_only)
+    }
+
+    fn ancestors_with_min_pos(
+        self,
+        min_pos: IndexPosition,
+        first_parents_only: bool,
+    ) -> RevWalkAncestors<'a> {
         let index = self.index;
         let mut queue = RevWalkQueue::with_min_pos(min_pos);
         queue.extend_wanted(self.wanted, ());
         queue.extend_unwanted(self.unwanted);
         RevWalkBorrowedIndexIter {
             index,
-            walk: RevWalkImpl { queue },
+            walk: RevWalkImpl {
+                queue,
+                first_parents_only,
+            },
         }
     }
 
@@ -438,6 +449,7 @@ impl<'a> RevWalkBuilder<'a> {
     pub fn ancestors_filtered_by_generation(
         self,
         generation_range: Range<u32>,
+        first_parents_only: bool,
     ) -> RevWalkAncestorsGenerationRange<'a> {
         let index = self.index;
         let mut queue = RevWalkQueue::with_min_pos(IndexPosition::MIN);
@@ -449,6 +461,7 @@ impl<'a> RevWalkBuilder<'a> {
             walk: RevWalkGenerationRangeImpl {
                 queue,
                 generation_end: generation_range.end,
+                first_parents_only,
             },
         }
     }
@@ -469,7 +482,7 @@ impl<'a> RevWalkBuilder<'a> {
             .into_iter()
             .min()
             .unwrap_or(IndexPosition::MAX);
-        self.ancestors_with_min_pos(min_pos)
+        self.ancestors_with_min_pos(min_pos, false)
     }
 
     /// Fully consumes ancestors and walks back from the `root_positions`.
@@ -520,6 +533,7 @@ impl<'a> RevWalkBuilder<'a> {
             walk: RevWalkGenerationRangeImpl {
                 queue,
                 generation_end: generation_range.end,
+                first_parents_only: false,
             },
         }
     }
@@ -532,6 +546,8 @@ pub(super) type RevWalkAncestors<'a> =
 #[must_use]
 pub(super) struct RevWalkImpl<P> {
     queue: RevWalkQueue<P, ()>,
+    /// Traverse only through first parents
+    first_parents_only: bool,
 }
 
 impl<I: RevWalkIndex + ?Sized> RevWalk<I> for RevWalkImpl<I::Position> {
@@ -541,8 +557,13 @@ impl<I: RevWalkIndex + ?Sized> RevWalk<I> for RevWalkImpl<I::Position> {
         while let Some(item) = self.queue.pop() {
             self.queue.skip_while_eq(&item.pos);
             if item.is_wanted() {
-                self.queue
-                    .extend_wanted(index.adjacent_positions(item.pos), ());
+                let adjacent_positions = index.adjacent_positions(item.pos);
+                if (self.first_parents_only) {
+                    self.queue
+                        .extend_wanted(adjacent_positions.into_iter().take(1), ());
+                } else {
+                    self.queue.extend_wanted(adjacent_positions, ());
+                }
                 return Some(item.pos);
             } else if self.queue.items.len() == self.queue.unwanted_count {
                 // No more wanted entries to walk
@@ -575,6 +596,7 @@ pub(super) struct RevWalkGenerationRangeImpl<P> {
     // Sort item generations in ascending order
     queue: RevWalkQueue<P, Reverse<RevWalkItemGenerationRange>>,
     generation_end: u32,
+    first_parents_only: bool,
 }
 
 impl<P: Ord> RevWalkGenerationRangeImpl<P> {
@@ -590,8 +612,14 @@ impl<P: Ord> RevWalkGenerationRangeImpl<P> {
             start: gen.start + 1,
             end: gen.end.saturating_add(1),
         };
-        self.queue
-            .extend_wanted(index.adjacent_positions(pos), Reverse(succ_gen));
+        let adjacent_positions = index.adjacent_positions(pos);
+        if self.first_parents_only {
+            self.queue
+                .extend_wanted(adjacent_positions.into_iter().take(1), Reverse(succ_gen));
+        } else {
+            self.queue
+                .extend_wanted(adjacent_positions, Reverse(succ_gen));
+        }
     }
 }
 
@@ -894,60 +922,77 @@ mod tests {
         index.add_commit_data(id_4.clone(), new_change_id(), &[id_1.clone()]);
         index.add_commit_data(id_5.clone(), new_change_id(), &[id_4.clone(), id_2.clone()]);
 
-        let walk_commit_ids = |wanted: &[CommitId], unwanted: &[CommitId]| {
+        let walk_commit_ids = |wanted: &[CommitId], unwanted: &[CommitId], first_parents_only: bool| {
             let index = index.as_composite();
             RevWalkBuilder::new(index)
                 .wanted_heads(to_positions_vec(index, wanted))
                 .unwanted_roots(to_positions_vec(index, unwanted))
-                .ancestors()
+                .ancestors_with_first_parents(first_parents_only)
                 .map(|pos| index.entry_by_pos(pos).commit_id())
                 .collect_vec()
         };
 
         // No wanted commits
-        assert!(walk_commit_ids(&[], &[]).is_empty());
+        assert!(walk_commit_ids(&[], &[], false).is_empty());
         // Simple linear walk to roo
         assert_eq!(
-            walk_commit_ids(&[id_4.clone()], &[]),
+            walk_commit_ids(&[id_4.clone()], &[], false),
+            vec![id_4.clone(), id_1.clone(), id_0.clone()]
+        );
+        assert_eq!(
+            walk_commit_ids(&[id_4.clone()], &[], true),
             vec![id_4.clone(), id_1.clone(), id_0.clone()]
         );
         // Commits that are both wanted and unwanted are not walked
-        assert_eq!(walk_commit_ids(&[id_0.clone()], &[id_0.clone()]), vec![]);
+        assert_eq!(walk_commit_ids(&[id_0.clone()], &[id_0.clone()], false), vec![]);
         // Commits that are listed twice are only walked once
         assert_eq!(
-            walk_commit_ids(&[id_0.clone(), id_0.clone()], &[]),
+            walk_commit_ids(&[id_0.clone(), id_0.clone()], &[], false),
             vec![id_0.clone()]
         );
         // If a commit and its ancestor are both wanted, the ancestor still gets walked
         // only once
         assert_eq!(
-            walk_commit_ids(&[id_0.clone(), id_1.clone()], &[]),
+            walk_commit_ids(&[id_0.clone(), id_1.clone()], &[], false),
             vec![id_1.clone(), id_0.clone()]
         );
         // Ancestors of both wanted and unwanted commits are not walked
         assert_eq!(
-            walk_commit_ids(&[id_2.clone()], &[id_1.clone()]),
+            walk_commit_ids(&[id_2.clone()], &[id_1.clone()], false),
             vec![id_2.clone()]
         );
         // Same as above, but the opposite order, to make sure that order in index
         // doesn't matter
         assert_eq!(
-            walk_commit_ids(&[id_1.clone()], &[id_2.clone()]),
+            walk_commit_ids(&[id_1.clone()], &[id_2.clone()], false),
             vec![id_1.clone()]
         );
         // Two wanted nodes
         assert_eq!(
-            walk_commit_ids(&[id_1.clone(), id_2.clone()], &[]),
+            walk_commit_ids(&[id_1.clone(), id_2.clone()], &[], false),
             vec![id_2.clone(), id_1.clone(), id_0.clone()]
         );
         // Order of output doesn't depend on order of input
         assert_eq!(
-            walk_commit_ids(&[id_2.clone(), id_1.clone()], &[]),
+            walk_commit_ids(&[id_2.clone(), id_1.clone()], &[], false),
             vec![id_2.clone(), id_1.clone(), id_0]
+        );
+        // First parents
+        assert_eq!(
+            walk_commit_ids(&[id_5.clone()], &[], false),
+            vec![id_5, id_4, id_2, id_1, id_0]
+        );
+        assert_eq!(
+            walk_commit_ids(&[id_5.clone()], &[], true),
+            vec![id_5, id_4, id_1, id_0]
         );
         // Two wanted nodes that share an unwanted ancestor
         assert_eq!(
-            walk_commit_ids(&[id_5.clone(), id_3.clone()], &[id_2]),
+            walk_commit_ids(&[id_5.clone(), id_3.clone()], &[id_2], false),
+            vec![id_5, id_4, id_3, id_1]
+        );
+        assert_eq!(
+            walk_commit_ids(&[id_5.clone(), id_3.clone()], &[id_2], true),
             vec![id_5, id_4, id_3, id_1]
         );
     }
@@ -1048,7 +1093,7 @@ mod tests {
             RevWalkBuilder::new(index)
                 .wanted_heads(to_positions_vec(index, wanted))
                 .unwanted_roots(to_positions_vec(index, unwanted))
-                .ancestors_filtered_by_generation(range)
+                .ancestors_filtered_by_generation(range, false)
                 .map(|pos| index.entry_by_pos(pos).commit_id())
                 .collect_vec()
         };
@@ -1125,7 +1170,7 @@ mod tests {
             let index = index.as_composite();
             RevWalkBuilder::new(index)
                 .wanted_heads(to_positions_vec(index, wanted))
-                .ancestors_filtered_by_generation(range)
+                .ancestors_filtered_by_generation(range, false)
                 .map(|pos| index.entry_by_pos(pos).commit_id())
                 .collect_vec()
         };
