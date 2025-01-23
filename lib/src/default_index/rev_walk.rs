@@ -543,11 +543,37 @@ pub(super) type RevWalkAncestors<'a> =
     RevWalkBorrowedIndexIter<'a, CompositeIndex, RevWalkImpl<IndexPosition>>;
 
 #[derive(Clone)]
+struct WalkFilter {
+    /// Traverse only through first parents
+    first_parents_only: bool,
+}
+
+impl WalkFilter {
+    fn first_parents() -> Self {
+        Self { first_parents_only: true }
+    }
+
+    fn adjacent_positions<I: RevWalkIndex + ?Sized>(&self, index: &I, pos: I::Position) -> impl IntoIterator<Item = I> {
+        let adjacent_positions = index.adjacent_positions(pos);
+        if self.first_parents_only {
+            adjacent_positions.into_iter().take(1)
+        } else {
+            adjacent_positions.into_iter().take(1000)
+        }
+    }
+}
+
+impl Default for WalkFilter {
+    fn default() -> Self {
+        Self { first_parents_only: false }
+    }
+}
+
+#[derive(Clone)]
 #[must_use]
 pub(super) struct RevWalkImpl<P> {
     queue: RevWalkQueue<P, ()>,
-    /// Traverse only through first parents
-    first_parents_only: bool,
+    filter: WalkFilter,
 }
 
 impl<I: RevWalkIndex + ?Sized> RevWalk<I> for RevWalkImpl<I::Position> {
@@ -557,13 +583,7 @@ impl<I: RevWalkIndex + ?Sized> RevWalk<I> for RevWalkImpl<I::Position> {
         while let Some(item) = self.queue.pop() {
             self.queue.skip_while_eq(&item.pos);
             if item.is_wanted() {
-                let adjacent_positions = index.adjacent_positions(item.pos);
-                if (self.first_parents_only) {
-                    self.queue
-                        .extend_wanted(adjacent_positions.into_iter().take(1), ());
-                } else {
-                    self.queue.extend_wanted(adjacent_positions, ());
-                }
+                self.queue.extend_wanted(self.filter.adjacent_positions(index, item.pos), ());
                 return Some(item.pos);
             } else if self.queue.items.len() == self.queue.unwanted_count {
                 // No more wanted entries to walk
@@ -571,7 +591,7 @@ impl<I: RevWalkIndex + ?Sized> RevWalk<I> for RevWalkImpl<I::Position> {
                 return None;
             } else {
                 self.queue
-                    .extend_unwanted(index.adjacent_positions(item.pos));
+                    .extend_unwanted(self.filter.adjacent_positions(index, item.pos));
             }
         }
 
