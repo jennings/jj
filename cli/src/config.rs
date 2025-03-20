@@ -49,36 +49,18 @@ pub const CONFIG_SCHEMA: &str = include_str!("config-schema.json");
 pub fn parse_value_or_bare_string(value_str: &str) -> Result<ConfigValue, toml_edit::TomlError> {
     match value_str.parse() {
         Ok(value) => Ok(value),
-        Err(_) if value_str.as_bytes().iter().copied().all(is_bare_char) => Ok(value_str.into()),
-        Err(err) => Err(err),
+        Err(err) if is_intended_toml_value(value_str) => Err(err),
+        Err(_) => Ok(value_str.into()),
     }
 }
 
-const fn is_bare_char(b: u8) -> bool {
-    match b {
-        // control chars (including tabs and newlines), which are unlikely to
-        // appear in command-line arguments
-        b'\x00'..=b'\x1f' | b'\x7f' => false,
-        // space and symbols that don't construct a TOML value
-        b' ' | b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | b'/' | b';' | b'<'
-        | b'>' | b'?' | b'@' | b'\\' | b'^' | b'_' | b'`' | b'|' | b'~' => true,
-        // there may be an error in integer, float, or date-time, but that's rare
-        b'+' | b'-' | b'.' | b':' => true,
-        // comma doesn't construct a compound value by itself, and it might be
-        // used in real name #5233
-        b',' => true,
-        // equal doesn't construct a compound value by itself, but it suggest
-        // that the value is an inline table
-        b'=' => false,
-        // unpaired quotes are often typo
-        b'"' | b'\'' => false,
-        // symbols that construct an inline array or table
-        b'[' | b']' | b'{' | b'}' => false,
-        // ASCII alphanumeric
-        b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => true,
-        // non-ASCII
-        b'\x80'..=b'\xff' => true,
-    }
+/// Determines whether a given config value looks like it was intended to be a
+/// TOML value rather than an unquoted string.
+fn is_intended_toml_value(s: &str) -> bool {
+    s.starts_with("'") ||
+    s.starts_with("\"") ||
+    s.starts_with("{") ||
+    s.starts_with("[") 
 }
 
 /// Configuration variable with its source information.
@@ -817,6 +799,7 @@ mod tests {
         assert_eq!(parse("").unwrap().as_str(), Some(""));
         assert_eq!(parse("John Doe").unwrap().as_str(), Some("John Doe"));
         assert_eq!(parse("Doe, John").unwrap().as_str(), Some("Doe, John"));
+        assert_eq!(parse("Michael D'Angelo").unwrap().as_str(), Some("Michael D'Angelo"));
         assert_eq!(
             parse("<foo+bar@example.org>").unwrap().as_str(),
             Some("<foo+bar@example.org>")
@@ -826,12 +809,12 @@ mod tests {
         assert_eq!(parse("glob:*.*").unwrap().as_str(), Some("glob:*.*"));
         assert_eq!(parse("柔術").unwrap().as_str(), Some("柔術"));
 
-        // Error in TOML value
-        assert!(parse("'foo").is_err());
-        assert!(parse("[0 1]").is_err());
-        assert!(parse("{ x = }").is_err());
-        assert!(parse("key = 'value'").is_err());
-        assert!(parse("[table]\nkey = 'value'").is_err());
+        // Bare strings that look almost like TOML values
+        assert_eq!(parse("'foo").unwrap().as_str(), Some("'foo"));
+        assert_eq!(parse("[0 1]").unwrap().as_str(), Some("[0 1]"));
+        assert_eq!(parse("{ x = }").unwrap().as_str(), Some("{ x = }"));
+        assert_eq!(parse("key = 'value'").unwrap().as_str(), Some("key = 'value'"));
+        assert_eq!(parse("[table]\nkey = 'value'").unwrap().as_str(), Some("[table]\nkey = 'value'"));
     }
 
     #[test]
