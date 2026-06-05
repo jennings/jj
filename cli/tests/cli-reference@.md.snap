@@ -2990,9 +2990,9 @@ $ jj run -j 4 -- pre-commit run .github/pre-commit.yaml
 ###### **Options:**
 
 * `-r`, `--revision <REVSETS>` — The revisions to change
-* `-j`, `--jobs <JOBS>` — How many processes should run in parallel
+* `-j`, `--jobs <JOBS>` — How many working copies (and parallel processes) to use
 
-  Default value: `1`
+   Overrides the `run.jobs` config setting.
 * `--root` — Run the command from the working-copy root in each commit instead of from the subdirectory `jj run` was invoked from
 
 

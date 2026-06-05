@@ -462,13 +462,13 @@ fn test_run_recovers_after_failure() {
     work_dir.write_file("b.txt", "b");
     work_dir.run_jj(&["commit", "-m", "B"]).success();
 
-    // First run fails outright on every commit, leaving the per-commit
-    // working copies in `.jj/run/default/` behind.
+    // First run fails; the slots under `.jj/run/default/` are left without a
+    // persisted tree_state (the dirty-marker mechanism).
     let first = work_dir.run_jj(&["run", "-r", "..@", "--", &fake_formatter_path, "--fail"]);
     assert!(!first.status.success(), "expected first `jj run` to fail");
 
-    // A second run with a working command must succeed despite those leftover
-    // directories — `jj run` clears each per-commit dir before reusing it.
+    // A second run with a working command must succeed: the missing tree_state
+    // triggers a clean wipe-and-reinit of each slot.
     work_dir
         .run_jj(&[
             "run",
@@ -608,17 +608,457 @@ fn test_run_sets_workspace_root_env_var() {
             + "\n"
     };
     // $TEST_ENV is the normalized placeholder for the test environment's temp
-    // root directory. JJ_WORKSPACE_ROOT should point to the per-commit
-    // isolated working copy under .jj/run/default/<commit-id>/working_copy,
-    // not to the original workspace.
+    // root directory. JJ_WORKSPACE_ROOT should point to the slot working copy
+    // under .jj/run/default/1/working_copy, not to the original workspace.
     insta::assert_snapshot!(
         work_dir
             .run_jj(&["file", "show", "-r", "@-", "workspace_root.txt"])
             .normalize_stdout_with(normalize_whitespace),
         @r"
-    $TEST_ENV/repo/.jj/run/default/5fbe90560fed1c39d46a46a672ba98abd53bdc6d/working_copy
+    $TEST_ENV/repo/.jj/run/default/1/working_copy
     [EOF]
     "
+    );
+}
+
+#[test]
+fn test_run_pool_persists_between_runs() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("seed.txt", "seed");
+    work_dir.run_jj(&["commit", "-m", "seed"]).success();
+
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "touch",
+            "ran.txt",
+        ])
+        .success();
+
+    // The pool slot directory survives the run.
+    let pool_slot = work_dir.root().join(".jj/run/default/1");
+    assert!(
+        pool_slot.exists(),
+        "expected pool slot 1 to persist between runs at {pool_slot:?}",
+    );
+    assert!(pool_slot.join("working_copy").exists());
+    assert!(pool_slot.join("state").exists());
+
+    // A second run reuses the existing slot rather than recreating it from
+    // scratch.
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "touch",
+            "ran2.txt",
+        ])
+        .success();
+    assert!(pool_slot.join("working_copy").exists());
+}
+
+#[test]
+fn test_run_pool_size_from_config() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("a.txt", "a");
+    work_dir.run_jj(&["commit", "-m", "A"]).success();
+    work_dir.write_file("b.txt", "b");
+    work_dir.run_jj(&["commit", "-m", "B"]).success();
+    work_dir.write_file("c.txt", "c");
+    work_dir.run_jj(&["commit", "-m", "C"]).success();
+
+    // `run.jobs = 1` forces all three commits to share a single slot
+    // and be processed sequentially.
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "..@",
+            "--",
+            "touch",
+            "ran.txt",
+        ])
+        .success();
+
+    let pool_dir = work_dir.root().join(".jj/run/default");
+    assert!(pool_dir.join("1").exists(), "pool/1 should exist");
+    assert!(
+        !pool_dir.join("2").exists(),
+        "pool/2 should NOT exist with size=1",
+    );
+
+    // All three commits picked up `ran.txt`.
+    for parent in ["@---", "@--", "@-"] {
+        let files = work_dir
+            .run_jj(&["file", "list", "-r", parent])
+            .success()
+            .stdout
+            .to_string();
+        assert!(
+            files.contains("ran.txt"),
+            "expected ran.txt in {parent}, got:\n{files}",
+        );
+    }
+}
+
+/// `--jobs N` controls pool size when `run.jobs` is not set.
+#[test]
+fn test_run_pool_size_from_jobs_flag() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("a.txt", "a");
+    work_dir.run_jj(&["commit", "-m", "A"]).success();
+    work_dir.write_file("b.txt", "b");
+    work_dir.run_jj(&["commit", "-m", "B"]).success();
+    work_dir.write_file("c.txt", "c");
+    work_dir.run_jj(&["commit", "-m", "C"]).success();
+
+    // `--jobs 2` with pool: expect exactly 2 slots, no more.
+    work_dir
+        .run_jj(&["run", "--jobs", "2", "-r", "..@", "--", "touch", "ran.txt"])
+        .success();
+
+    let pool_dir = work_dir.root().join(".jj/run/default");
+    assert!(pool_dir.join("1").exists(), "pool/1 should exist");
+    assert!(pool_dir.join("2").exists(), "pool/2 should exist");
+    assert!(
+        !pool_dir.join("3").exists(),
+        "pool/3 must NOT exist with --jobs 2",
+    );
+}
+
+#[test]
+fn test_run_pool_preserves_untracked_artifacts() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // The .gitignore keeps `cache/` out of the snapshot's tracking set, so
+    // files there persist on disk between jobs without being committed.
+    work_dir.write_file(".gitignore", "cache/\n");
+    work_dir.write_file("seed.txt", "seed");
+    work_dir.run_jj(&["commit", "-m", "seed"]).success();
+
+    // Run 1: drop a marker into the gitignored cache directory.
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "sh",
+            "-c",
+            "mkdir -p cache && echo run1 > cache/marker && touch ran1.txt",
+        ])
+        .success();
+
+    // Run 2: assert the marker is still there, write its contents into a
+    // tracked file so we can verify from outside.
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "sh",
+            "-c",
+            "if [ -f cache/marker ]; then cp cache/marker result.txt; else echo MISSING > \
+             result.txt; fi",
+        ])
+        .success();
+
+    let result = work_dir
+        .run_jj(&["file", "show", "-r", "@-", "result.txt"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        result.starts_with("run1"),
+        "expected result.txt to contain marker content from run 1; got: {result}",
+    );
+}
+
+/// Pool correctly removes a file that is present in one commit's tree but
+/// absent in the next commit processed by the same slot.
+#[test]
+fn test_run_pool_removes_file_absent_in_next_commit() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // Commit A has only_in_a.txt.
+    work_dir.write_file("only_in_a.txt", "a");
+    work_dir.run_jj(&["commit", "-m", "A"]).success();
+    // After commit -m A the WC inherits A's files. Delete the file so that
+    // commit B's tree is empty (no only_in_a.txt).
+    std::fs::remove_file(work_dir.root().join("only_in_a.txt")).unwrap();
+    work_dir.run_jj(&["commit", "-m", "B"]).success();
+    // Stack: root → A (only_in_a.txt) → B ({}) → @
+
+    // Pool size 1 forces both commits through the same slot sequentially.
+    // @-- = A, @- = B (WC is above B).
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@--::@-",
+            "--",
+            "touch",
+            "ran.txt",
+        ])
+        .success();
+
+    // A's rewrite (@--) keeps only_in_a.txt (and gains ran.txt).
+    let files_a = work_dir
+        .run_jj(&["file", "list", "-r", "@--"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        files_a.contains("only_in_a.txt"),
+        "expected only_in_a.txt in A; got:\n{files_a}",
+    );
+
+    // B's rewrite (@-) must NOT have only_in_a.txt leaked from A's slot.
+    let files_b = work_dir
+        .run_jj(&["file", "list", "-r", "@-"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        !files_b.contains("only_in_a.txt"),
+        "only_in_a.txt must not leak into B; got:\n{files_b}",
+    );
+    assert!(
+        files_b.contains("ran.txt"),
+        "expected ran.txt in B; got:\n{files_b}",
+    );
+}
+
+/// Files created by a command (not in `.gitignore`) must not leak from one
+/// commit to another in the same `jj run` invocation.
+#[test]
+fn test_run_pool_no_file_leak_between_commits() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("seed.txt", "seed");
+    work_dir.run_jj(&["commit", "-m", "A"]).success();
+    work_dir.run_jj(&["commit", "-m", "B"]).success();
+    work_dir.run_jj(&["commit", "-m", "C"]).success();
+
+    // A's command produces from_a.txt; B and C do not.
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "..@",
+            "--",
+            "sh",
+            "-c",
+            // Write from_a.txt only for commit A; B and C only touch ran.txt.
+            r#"if [ "$JJ_CHANGE_ID" = "$(jj log -r '@---' --no-graph -T change_id 2>/dev/null)" ]; then touch from_a.txt; fi; touch ran.txt"#,
+        ])
+        .success();
+
+    // A's rewrite may or may not have from_a.txt depending on the order of
+    // processing, but B and C must not have it.
+    for (rev, parent) in [("B", "@--"), ("C", "@-")] {
+        let files = work_dir
+            .run_jj(&["file", "list", "-r", parent])
+            .success()
+            .stdout
+            .to_string();
+        assert!(
+            !files.contains("from_a.txt"),
+            "from_a.txt must not leak into commit {rev}; got:\n{files}",
+        );
+    }
+}
+
+/// Files tracked into a commit by run 1 must not reappear in a different
+/// commit processed by the same pool slot in run 2.
+///
+/// Run 1 rewrites commit2 (adding artifact.txt). The slot's saved tree_state
+/// therefore records {seed.txt, artifact.txt}. Run 2 targets commit1 whose
+/// tree is {seed.txt}; the checkout diff removes artifact.txt from the slot,
+/// so commit1's rewrite must not contain it.
+#[test]
+fn test_run_pool_no_file_leak_between_invocations() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // commit1: seed.txt only.
+    work_dir.write_file("seed.txt", "seed");
+    work_dir.run_jj(&["commit", "-m", "commit1"]).success();
+    // commit2: descends from commit1, no extra files (same tree).
+    work_dir.run_jj(&["commit", "-m", "commit2"]).success();
+    // Stack: root → commit1 (seed.txt) → commit2 (seed.txt) → @
+
+    // Run 1: produce artifact.txt in commit2 (@-) so the slot's saved
+    // tree_state records {seed.txt, artifact.txt}.
+    // Stack before run 1: root → commit1 (@--) → commit2 (@-) → @
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "touch",
+            "artifact.txt",
+        ])
+        .success();
+    // After run 1: root → commit1 (@--) → commit2' (@-) → @ (rebased).
+    // commit2' now has {seed.txt, artifact.txt}.
+
+    // Run 2: no-op on commit1 (@--). Pool reuses the slot whose tree_state
+    // says {seed.txt, artifact.txt}. The checkout diff removes artifact.txt,
+    // so commit1's rewrite must not contain it.
+    work_dir
+        .run_jj(&["run", "--config", "run.jobs=1", "-r", "@--", "--", "true"])
+        .success();
+    // After run 2: root → commit1' (@--) → commit2'' (@-) → @ (rebased).
+
+    let files = work_dir
+        .run_jj(&["file", "list", "-r", "@--"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        !files.contains("artifact.txt"),
+        "artifact.txt must not leak into commit1 from previous slot state; got:\n{files}",
+    );
+    assert!(
+        files.contains("seed.txt"),
+        "expected seed.txt in commit1; got:\n{files}",
+    );
+}
+
+/// A slot whose tree_state is absent (simulating a crash mid-job) should be
+/// wiped and reinitialised on the next acquisition, not produce garbage.
+#[test]
+fn test_run_pool_recovers_from_missing_tree_state() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("seed.txt", "seed");
+    work_dir.run_jj(&["commit", "-m", "seed"]).success();
+
+    // Prime the slot so working_copy/ exists.
+    work_dir
+        .run_jj(&["run", "--config", "run.jobs=1", "-r", "@-", "--", "true"])
+        .success();
+
+    // Simulate a crash: plant a stale file in the slot and delete tree_state.
+    let slot = work_dir.root().join(".jj/run/default/1");
+    std::fs::write(slot.join("working_copy/stale.txt"), "crash leftovers").unwrap();
+    std::fs::remove_file(slot.join("state/tree_state")).unwrap();
+
+    // A second run should wipe the stale state and produce a clean rewrite.
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "touch",
+            "ran.txt",
+        ])
+        .success();
+
+    let files = work_dir
+        .run_jj(&["file", "list", "-r", "@-"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        files.contains("ran.txt"),
+        "expected ran.txt in rewrite after recovery; got:\n{files}",
+    );
+    assert!(
+        !files.contains("stale.txt"),
+        "stale.txt must not survive crash recovery; got:\n{files}",
+    );
+}
+
+/// A failed command (non-zero exit) must not poison the pool slot for the
+/// next `jj run` invocation.
+#[test]
+fn test_run_pool_failed_command_does_not_poison_slot() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("seed.txt", "seed");
+    work_dir.run_jj(&["commit", "-m", "seed"]).success();
+
+    // Run 1: command fails, but writes a file first.
+    drop(work_dir.run_jj(&[
+        "run",
+        "--config",
+        "run.jobs=1",
+        "-r",
+        "@-",
+        "--",
+        "sh",
+        "-c",
+        "touch poison.txt; exit 1",
+    ]));
+
+    // Run 2: a clean command. poison.txt must not appear in the rewrite.
+    work_dir
+        .run_jj(&[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "touch",
+            "ran.txt",
+        ])
+        .success();
+
+    let files = work_dir
+        .run_jj(&["file", "list", "-r", "@-"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(files.contains("ran.txt"), "expected ran.txt; got:\n{files}",);
+    assert!(
+        !files.contains("poison.txt"),
+        "poison.txt from failed run must not appear; got:\n{files}",
     );
 }
 
