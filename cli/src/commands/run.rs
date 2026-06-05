@@ -20,11 +20,13 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Write as _;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::TryStreamExt as _;
 use itertools::Itertools as _;
@@ -42,7 +44,7 @@ use jj_lib::local_working_copy::TreeStateError;
 use jj_lib::local_working_copy::TreeStateSettings;
 use jj_lib::lock::FileLock;
 use jj_lib::lock::FileLockError;
-use jj_lib::matchers::EverythingMatcher;
+use jj_lib::matchers::Matcher;
 use jj_lib::matchers::NothingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
@@ -83,7 +85,9 @@ enum RunError {
     #[error(transparent)]
     JobFailure(#[from] JoinError),
     #[error(transparent)]
-    LockError(#[from] FileLockError),
+    FileLock(#[from] FileLockError),
+    #[error("invalid value for `run.jobs`: {0} (must be a positive integer)")]
+    InvalidJobCount(i64),
 }
 
 impl From<RunError> for CommandError {
@@ -92,61 +96,33 @@ impl From<RunError> for CommandError {
     }
 }
 
-/// Provision an isolated per-commit working copy under `base_path` and check
-/// out `commit`'s tree into it. Returns the working-copy directory and its
-/// initialized `TreeState`, ready for the caller to spawn a command in and
-/// later snapshot.
-async fn create_working_copy(
-    base_path: &Path,
-    commit: &Commit,
-) -> Result<(PathBuf, TreeState), RunError> {
-    // Per-commit working-copy directory, keyed by commit id so concurrent jobs
-    // don't collide and so the working copy is reproducible across runs.
-    let commit_path = base_path.join(commit.id().hex());
-    // A previous `jj run` that failed before cleanup may have left this
-    // directory behind. Clear it so the working_copy/state subdirs below
-    // start from a clean slate.
-    if commit_path.exists() {
-        tracing::debug!(
-            dir = ?commit_path,
-            commit = commit.id().hex(),
-            "removing leftover directory from a previous run"
-        );
-        fs::remove_dir_all(&commit_path)
-            .map_err(|e| RunError::PathCreationFailure(commit_path.clone(), e))?;
-    }
-    tracing::debug!(
-        dir = ?commit_path,
-        commit = commit.id().hex(),
-        "creating directory for commit"
-    );
-    fs::create_dir(&commit_path)
-        .map_err(|e| RunError::PathCreationFailure(commit_path.clone(), e))?;
-
-    tracing::debug!(?commit_path, "creating working copy paths for path");
-    let working_copy_dir = commit_path.join("working_copy");
-    let state_dir = commit_path.join("state");
-    tracing::debug!(?working_copy_dir, ?state_dir, "creating paths for a commit");
-    fs::create_dir(&working_copy_dir)
-        .map_err(|e| RunError::PathCreationFailure(working_copy_dir.clone(), e))?;
-    fs::create_dir(&state_dir).map_err(|e| RunError::PathCreationFailure(state_dir.clone(), e))?;
-    let tree_state_settings = TreeStateSettings {
+fn default_tree_state_settings() -> TreeStateSettings {
+    TreeStateSettings {
         conflict_marker_style: ConflictMarkerStyle::Snapshot,
         eol_conversion_mode: EolConversionMode::None,
         exec_change_setting: ExecChangeSetting::Auto,
         fsmonitor_settings: FsmonitorSettings::None,
-    };
-    let mut tree_state = TreeState::init(
-        commit.store().clone(),
-        working_copy_dir.clone(),
-        state_dir,
-        &tree_state_settings,
-    )?;
-    tree_state
-        .check_out(&commit.tree())
-        .map_err(|_| RunError::FailedCheckout(commit.id().clone()))?;
+    }
+}
 
-    Ok((working_copy_dir, tree_state))
+/// A workspace that's ready for a single job to run against.
+///
+/// Dropping the workspace releases its interprocess lock, freeing the slot for
+/// the next worker.
+struct RunWorkspace {
+    working_copy_dir: PathBuf,
+    tree_state: TreeState,
+    /// Holds the slot's interprocess lock for the duration of the job.
+    _lock: FileLock,
+}
+
+impl RunWorkspace {
+    /// Persist the post-snapshot tree state to disk so the next slot
+    /// acquisition can diff against it and only touch changed files.
+    fn persist(&mut self) -> Result<(), RunError> {
+        self.tree_state.save()?;
+        Ok(())
+    }
 }
 
 /// A command, its arguments, and the workspace-relative directory it should
@@ -167,6 +143,151 @@ impl fmt::Display for CommandSpec {
             f.write_str(arg)?;
         }
         Ok(())
+    }
+}
+
+/// Manages a fixed-size pool of workspaces under `.jj/run/default/`.
+///
+/// Each workspace lives at `.jj/run/default/N/` with subdirs `working_copy/`
+/// and `state/`. Its lockfile is the sibling `.jj/run/default/N.lock`.
+/// Workspaces persist between `jj run` invocations so build artifacts can be
+/// reused. Acquisition picks the first free workspace, so multiple concurrent
+/// `jj run` processes cooperatively share the pool.
+struct WorkspacePool {
+    base_path: PathBuf,
+    size: NonZeroUsize,
+    /// Determines which untracked files left in a slot get pulled into the
+    /// rewritten commit. Loaded once from `snapshot.auto-track`; essentially
+    /// the user's `.gitignore` story for what counts as a build artifact.
+    auto_tracking_matcher: Box<dyn Matcher>,
+}
+
+impl WorkspacePool {
+    fn new(
+        repo_path: &Path,
+        size: NonZeroUsize,
+        auto_tracking_matcher: Box<dyn Matcher>,
+    ) -> Result<Self, RunError> {
+        // The parent() call is needed to not write under `.jj/repo/`.
+        let base_path = repo_path.parent().unwrap().join("run").join("default");
+        if !base_path.exists() {
+            tracing::debug!(?base_path, "creating pool base directory");
+            fs::create_dir_all(&base_path)?;
+        }
+        Ok(Self {
+            base_path,
+            size,
+            auto_tracking_matcher,
+        })
+    }
+
+    async fn acquire(&self, commit: &Commit) -> Result<RunWorkspace, RunError> {
+        // Find a free slot. The first iteration may fail if another worker
+        // (this process or another) holds every slot; sleep and retry.
+        let mut sleep = Duration::from_millis(10);
+        let max_sleep = Duration::from_millis(250);
+        let (slot_index, lock) = loop {
+            if let Some(found) = self.try_acquire_any_slot()? {
+                break found;
+            }
+            tokio::time::sleep(sleep).await;
+            sleep = std::cmp::min(sleep.saturating_mul(2), max_sleep);
+        };
+
+        let slot_path = self.slot_path(slot_index);
+        let working_copy_dir = slot_path.join("working_copy");
+        let state_dir = slot_path.join("state");
+        let tree_state_path = state_dir.join("tree_state");
+
+        let settings = default_tree_state_settings();
+        let mut tree_state = if tree_state_path.exists() {
+            // Clean reuse: load the persisted tree state so `check_out` below
+            // can diff against it, only touching files that changed and
+            // removing files no longer present in the new tree.
+            //
+            // Delete `tree_state` from disk before checkout to act as a dirty
+            // marker. If we crash between here and the save at the end of the
+            // job, the next acquisition will see the file absent and wipe the
+            // slot rather than trusting inconsistent state.
+            let ts = TreeState::load(
+                commit.store().clone(),
+                working_copy_dir.clone(),
+                state_dir.clone(),
+                &settings,
+            )?;
+            fs::remove_file(&tree_state_path)?;
+            ts
+        } else {
+            // First use, or the previous job crashed before saving. Wipe any
+            // leftover working copy so we start from a clean slate, then use
+            // an in-memory empty tree state. `tree_state` stays absent on disk
+            // until a job writes it via `persist()`.
+            if working_copy_dir.exists() {
+                fs::remove_dir_all(&working_copy_dir)
+                    .map_err(|e| RunError::PathCreationFailure(working_copy_dir.clone(), e))?;
+            }
+            if state_dir.exists() {
+                fs::remove_dir_all(&state_dir)
+                    .map_err(|e| RunError::PathCreationFailure(state_dir.clone(), e))?;
+            }
+            fs::create_dir_all(&working_copy_dir)
+                .map_err(|e| RunError::PathCreationFailure(working_copy_dir.clone(), e))?;
+            fs::create_dir_all(&state_dir)
+                .map_err(|e| RunError::PathCreationFailure(state_dir.clone(), e))?;
+            TreeState::init_without_saving(
+                commit.store().clone(),
+                working_copy_dir.clone(),
+                state_dir,
+                &settings,
+            )
+        };
+
+        tree_state
+            .check_out(&commit.tree())
+            .map_err(|_| RunError::FailedCheckout(commit.id().clone()))?;
+
+        Ok(RunWorkspace {
+            working_copy_dir,
+            tree_state,
+            _lock: lock,
+        })
+    }
+
+    fn snapshot_options(&self, base_ignores: Arc<GitIgnoreFile>) -> SnapshotOptions<'_> {
+        SnapshotOptions {
+            base_ignores,
+            start_tracking_matcher: self.auto_tracking_matcher.as_ref(),
+            progress: None,
+            // TODO: read from current wc/settings
+            max_new_file_size: 64_000_u64, // 64 MB for now
+            force_tracking_matcher: &NothingMatcher,
+        }
+    }
+
+    fn slot_path(&self, index: usize) -> PathBuf {
+        self.base_path.join(index.to_string())
+    }
+
+    fn slot_lock_path(&self, index: usize) -> PathBuf {
+        self.base_path.join(format!("{index}.lock"))
+    }
+
+    /// Try to acquire any slot's lock without blocking. Returns the slot
+    /// index and the held lock if one was available, `Ok(None)` if every
+    /// slot was contended.
+    fn try_acquire_any_slot(&self) -> Result<Option<(usize, FileLock)>, RunError> {
+        for i in 1..=self.size.get() {
+            let slot_path = self.slot_path(i);
+            if !slot_path.exists() {
+                fs::create_dir_all(&slot_path)
+                    .map_err(|e| RunError::PathCreationFailure(slot_path.clone(), e))?;
+            }
+            if let Some(lock) = FileLock::try_lock(self.slot_lock_path(i))? {
+                tracing::debug!(slot = i, "acquired pool slot");
+                return Ok(Some((i, lock)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -199,7 +320,7 @@ async fn run_inner(
     sender: Sender<RunJob>,
     handle: &tokio::runtime::Handle,
     spec: Arc<CommandSpec>,
-    base_path: Arc<PathBuf>,
+    pool: Arc<WorkspacePool>,
     commits: Arc<Vec<Commit>>,
     jobs: usize,
 ) -> Result<(), RunError> {
@@ -209,7 +330,7 @@ async fn run_inner(
     for commit in commits.iter() {
         let permit_future = semaphore.clone().acquire_owned();
         let base_ignores = base_ignores.clone();
-        let base_path = base_path.clone();
+        let pool = pool.clone();
         let commit = commit.clone();
         let spec = spec.clone();
         command_futures.spawn_on(
@@ -217,7 +338,7 @@ async fn run_inner(
                 let _permit: OwnedSemaphorePermit =
                     permit_future.await.expect("semaphore not closed");
                 // TODO: handle/propagate error here
-                rewrite_commit(base_ignores, base_path, commit, spec).await
+                rewrite_commit(base_ignores, pool, commit, spec).await
             },
             handle,
         );
@@ -242,20 +363,16 @@ async fn run_inner(
 
 /// Run `spec` against `commit`. The caller is responsible for committing any
 /// returned new tree to the repo.
-///
-/// Each invocation provisions its own per-commit working copy under
-/// `base_path` so multiple `rewrite_commit` futures can do their work in
-/// parallel without contending on shared state.
 async fn rewrite_commit(
     base_ignores: Arc<GitIgnoreFile>,
-    base_path: Arc<PathBuf>,
+    pool: Arc<WorkspacePool>,
     commit: Commit,
     spec: Arc<CommandSpec>,
 ) -> Result<RunJob, RunError> {
+    let mut workspace = pool.acquire(&commit).await?;
+    let working_copy_dir = workspace.working_copy_dir.clone();
     let old_id = commit.id().clone();
     let old_tree = commit.tree();
-
-    let (working_copy_dir, mut tree_state) = create_working_copy(&base_path, &commit).await?;
 
     // Resolve where the command should run. If the subdir doesn't exist in this
     // commit's checked-out tree, skip the commit entirely.
@@ -267,6 +384,9 @@ async fn rewrite_commit(
                 commit = old_id.hex(),
                 "subdirectory does not exist in commit; skipping"
             );
+            // Persist the post-checkout state so the next pool acquisition
+            // can diff from this tree even though no command ran.
+            workspace.persist()?;
             return Ok(RunJob {
                 old_id,
                 old_tree,
@@ -309,30 +429,9 @@ async fn rewrite_commit(
 
     let output = command.wait_with_output().await?;
 
-    if !output.status.success() {
-        return Ok(RunJob {
-            old_id,
-            old_tree,
-            new_tree: None,
-            dirty: false,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            skipped: false,
-            status: Some(output.status),
-        });
-    }
-
-    let options = SnapshotOptions {
-        base_ignores,
-        // TODO: read from current wc/settings
-        start_tracking_matcher: &EverythingMatcher,
-        progress: None,
-        // TODO: read from current wc/settings
-        max_new_file_size: 64_000_u64, // 64 MB for now,
-        force_tracking_matcher: &NothingMatcher,
-    };
+    let options = pool.snapshot_options(base_ignores);
     tracing::debug!("trying to snapshot the new tree");
-    let (dirty, _) = tree_state.snapshot(&options).await.unwrap();
+    let (dirty, stats) = workspace.tree_state.snapshot(&options).await.unwrap();
     if !dirty {
         tracing::debug!(
             "commit {} was not modified as the passed command did not modify any tracked files",
@@ -340,18 +439,42 @@ async fn rewrite_commit(
         );
     }
 
-    let rewritten_id = tree_state.current_tree().tree_ids();
-    let new_id = rewritten_id.as_resolved().unwrap();
+    if !output.status.success() {
+        // Remove non-ignored untracked files left by the command. Ignored paths
+        // are absent from `untracked_paths` and survive for build-artifact reuse.
+        // This keeps the slot free of stale files that would cause silent
+        // `skipped_files` collisions in the next `check_out`.
+        for path in stats.untracked_paths.keys() {
+            let abs = path.to_fs_path_unchecked(&working_copy_dir);
+            if let Err(err) = fs::remove_file(&abs)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Err(err.into());
+            }
+        }
+    }
 
-    let new_tree = commit.store().get_tree(RepoPathBuf::root(), new_id).await?;
+    // Persist the post-snapshot tree state so the next pool acquisition can
+    // diff against it and only touch files that changed. Done unconditionally
+    // so the slot is reusable even when the command failed.
+    workspace.persist()?;
 
-    // TODO: Serialize the new tree into /output/{id-tree} for a cache lookup
-    // TODO: supersede with a custom workspace implementation
+    let new_tree = if output.status.success() {
+        let rewritten_id = workspace.tree_state.current_tree().tree_ids();
+        let new_id = rewritten_id.as_resolved().unwrap();
+
+        Some(commit.store().get_tree(RepoPathBuf::root(), new_id).await?)
+
+        // TODO: Serialize the new tree into /output/{id-tree} for a cache
+        // lookup TODO: supersede with a custom workspace implementation
+    } else {
+        None
+    };
 
     Ok(RunJob {
         old_id,
         old_tree,
-        new_tree: Some(new_tree),
+        new_tree,
         dirty,
         stdout: output.stdout,
         stderr: output.stderr,
@@ -401,13 +524,43 @@ pub struct RunArgs {
     exec: bool,
 
     /// How many processes should run in parallel
-    #[arg(long, short, default_value_t = 1)]
-    jobs: usize,
+    ///
+    /// Overrides the `run.jobs` config setting. Defaults to 1 if neither is
+    /// set.
+    #[arg(long, short)]
+    jobs: Option<usize>,
 
     /// Run the command from the working-copy root in each commit instead of
     /// from the subdirectory `jj run` was invoked from.
     #[arg(long)]
     root: bool,
+}
+
+/// Precedence: `--jobs`, `run.jobs` config, 1.
+fn resolve_jobs(
+    workspace_command: &crate::cli_util::WorkspaceCommandHelper,
+    jobs: Option<usize>,
+) -> Result<NonZeroUsize, CommandError> {
+    if let Some(j) = jobs {
+        return NonZeroUsize::new(j).ok_or_else(|| {
+            CommandError::new(
+                CommandErrorKind::Cli,
+                Box::new(RunError::InvalidJobCount(0)),
+            )
+        });
+    }
+    if let Ok(size) = workspace_command.settings().get_int("run.jobs") {
+        let size: usize = size
+            .try_into()
+            .map_err(|_| RunError::InvalidJobCount(size))?;
+        return NonZeroUsize::new(size).ok_or_else(|| {
+            CommandError::new(
+                CommandErrorKind::Config,
+                Box::new(RunError::InvalidJobCount(0)),
+            )
+        });
+    }
+    Ok(NonZeroUsize::MIN)
 }
 
 pub async fn cmd_run(
@@ -418,22 +571,7 @@ pub async fn cmd_run(
     let repo_path = command.workspace_loader()?.repo_path().to_path_buf();
     // TODO: should be stored in a backend and not hardcoded.
     let base_path = repo_path.parent().unwrap().join("run").join("default");
-
-    // NOTE: we have to take the lock as early as possible before resolving
-    // revsets, so that if we block on an existing process to finish, we
-    // properly resolve the given set of commits if they were rewritten
-    let lock_dir = base_path
-        .parent()
-        .expect("run directory should have a parent");
-    fs::create_dir_all(lock_dir)?;
-    let lock_path = base_path.with_extension("lock");
-    let lock = match FileLock::try_lock(lock_path.clone()).map_err(RunError::from)? {
-        Some(lock) => lock,
-        None => {
-            writeln!(ui.status(), "Waiting for another `jj run` to finish...")?;
-            FileLock::lock(lock_path).map_err(RunError::from)?
-        }
-    };
+    fs::create_dir_all(&base_path)?;
 
     let mut workspace_command = command.workspace_helper(ui).await?;
     let resolved_commits: Vec<_> = if args.revisions.is_empty() {
@@ -455,16 +593,9 @@ pub async fn cmd_run(
         .check_rewritable(resolved_commits.iter().ids())
         .await?;
 
-    tracing::debug!(?args.jobs, "starting with `jj run` with available threads");
+    let jobs = resolve_jobs(&workspace_command, args.jobs)?;
 
-    let rt = {
-        let mut builder = Builder::new_multi_thread();
-        builder.enable_io();
-        builder.build().unwrap()
-    };
-    // TODO: Add a extension point for custom output/status aggregation.
-    let mut done_commits = HashSet::new();
-    let (sender_tx, mut receiver) = mpsc::channel(args.jobs);
+    tracing::debug!(?jobs, "starting `jj run`");
 
     // Run each command from the subdirectory the user invoked `jj run` from,
     // unless `--root` overrides that. The subdir is relative to the workspace
@@ -482,13 +613,20 @@ pub async fn cmd_run(
     };
 
     let store = workspace_command.repo().store().clone();
+    let auto_tracking_matcher = workspace_command.auto_tracking_matcher(ui)?;
+
     let mut tx = workspace_command.start_transaction();
 
-    // A previous run's cleanup (that may have finished while we waited for the
-    // lock) may have removed the base path directory, it, so (re)create it now
-    // that we hold the lock.
-    fs::create_dir_all(&base_path)?;
-    let base_path = Arc::new(base_path);
+    let rt = {
+        let mut builder = Builder::new_multi_thread();
+        builder.enable_io();
+        builder.enable_time();
+        builder.build().unwrap()
+    };
+    let mut done_commits = HashSet::new();
+    let (sender_tx, mut receiver) = mpsc::channel(jobs.get());
+
+    let pool = Arc::new(WorkspacePool::new(&repo_path, jobs, auto_tracking_matcher)?);
     let stored_len = resolved_commits.len();
 
     let spec = Arc::new(CommandSpec {
@@ -508,9 +646,9 @@ pub async fn cmd_run(
                 sender_tx,
                 rt.handle(),
                 spec.clone(),
-                base_path,
+                pool.clone(),
                 Arc::new(resolved_commits.clone()),
-                args.jobs,
+                jobs.get(),
             )
             .await
             .map_err(CommandError::from)
@@ -564,12 +702,8 @@ pub async fn cmd_run(
         },
     )?;
 
-    let run_path = repo_path.parent().unwrap().join("run").join("default");
     // The operation was a no-op, bail.
     if rewritten_commits.is_empty() {
-        // Yeet everything, caching is better implemented in a follow-up.
-        fs::remove_dir_all(&run_path)?;
-
         writeln!(
             ui.stderr(),
             "No commits were rewritten as the command did not modify any tracked files"
@@ -616,13 +750,8 @@ pub async fn cmd_run(
         )
         .await?;
     writeln!(ui.stderr(), "Rewrote {count} commits with {spec}")?;
-
-    // Yeet everything, caching is implemented in a follow-up.
-    fs::remove_dir_all(&run_path)?;
-
     tx.finish(ui, format!("run: rewrite {count} commits with {spec}"))
         .await?;
 
-    drop(lock);
     Ok(())
 }
