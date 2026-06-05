@@ -62,6 +62,58 @@ mod tests {
     }
 
     #[test]
+    fn try_lock_basic() {
+        let temp_dir = new_temp_dir();
+        let lock_path = temp_dir.path().join("test.lock");
+
+        // No contender: try_lock succeeds.
+        {
+            let lock = FileLock::try_lock(lock_path.clone()).unwrap();
+            assert!(lock.is_some());
+            assert!(lock_path.exists());
+        }
+
+        // After the lock is released, try_lock succeeds again.
+        let lock = FileLock::try_lock(lock_path.clone()).unwrap();
+        assert!(lock.is_some());
+    }
+
+    #[test]
+    fn try_lock_contended() {
+        let temp_dir = new_temp_dir();
+        let lock_path = temp_dir.path().join("test.lock");
+        let lock_path_for_holder = lock_path.clone();
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let _lock = FileLock::lock(lock_path_for_holder).unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        // Wait until the holder has the lock, then verify try_lock observes
+        // contention (returns None).
+        acquired_rx.recv().unwrap();
+        assert!(FileLock::try_lock(lock_path.clone()).unwrap().is_none());
+
+        // Tell the holder to release; once it does, try_lock should succeed.
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(_lock) = FileLock::try_lock(lock_path.clone()).unwrap() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "try_lock never recovered after holder dropped"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn lock_concurrent() {
         let temp_dir = new_temp_dir();
         let data_path = temp_dir.path().join("test");

@@ -61,6 +61,53 @@ impl FileLock {
             file: Some(file),
         })
     }
+
+    /// Try to acquire the lock without blocking.
+    ///
+    /// Returns `Ok(Some(_))` if the lock was acquired, `Ok(None)` if another
+    /// holder currently owns it, and `Err(_)` for IO errors that aren't
+    /// "would block".
+    pub fn try_lock(path: PathBuf) -> Result<Option<Self>, FileLockError> {
+        tracing::info!("Attempting to try-lock {path:?}");
+
+        // Opening the lockfile can hit a transient sharing violation when the
+        // previous holder is mid-`Drop` (file closed but the deletion handle is
+        // still in flight). Treat that as "currently locked" — the byte-range
+        // lock itself isn't checked, but the holder is by definition still
+        // around. The caller is expected to retry.
+        let file = match open_lock_file(&path) {
+            Ok(file) => file,
+            Err(err)
+                if err.kind() == io::ErrorKind::PermissionDenied
+                    || err.raw_os_error() == Some(ERROR_SHARING_VIOLATION as _) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(FileLockError {
+                    message: "Failed to open lock file",
+                    path,
+                    err,
+                });
+            }
+        };
+
+        match file.try_lock() {
+            Ok(()) => {
+                tracing::info!("Try-locked {path:?}");
+                Ok(Some(Self {
+                    path,
+                    file: Some(file),
+                }))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(err)) => Err(FileLockError {
+                message: "Failed to lock lock file",
+                path,
+                err,
+            }),
+        }
+    }
 }
 
 impl Drop for FileLock {
@@ -78,8 +125,7 @@ impl Drop for FileLock {
     }
 }
 
-fn try_create_file(path: &Path) -> io::Result<File> {
-    let mut backoff_iterator = BackoffIterator::new();
+fn lock_file_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options
         .create(true)
@@ -89,6 +135,19 @@ fn try_create_file(path: &Path) -> io::Result<File> {
         // open — so deletion in Drop only succeeds when we're the last handle
         // holder.
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    options
+}
+
+/// Open the lockfile, failing immediately on a sharing violation. Used by
+/// `try_lock`, which must not block waiting for another holder's `Drop` to
+/// finish.
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    lock_file_open_options().open(path)
+}
+
+fn try_create_file(path: &Path) -> io::Result<File> {
+    let mut backoff_iterator = BackoffIterator::new();
+    let options = lock_file_open_options();
     loop {
         match options.open(path) {
             Ok(file) => return Ok(file),

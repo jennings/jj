@@ -31,52 +31,94 @@ impl FileLock {
     pub fn lock(path: PathBuf) -> Result<Self, FileLockError> {
         tracing::info!("Attempting to lock {path:?}");
         loop {
-            // Create lockfile, or open pre-existing one
-            let file = File::create(&path).map_err(|err| FileLockError {
-                message: "Failed to open lock file",
-                path: path.clone(),
-                err,
-            })?;
-            // If the lock was already held, wait for it to be released
-            rustix::fs::flock(&file, FlockOperation::LockExclusive).map_err(|errno| {
-                FileLockError {
+            match Self::lock_attempt(&path, FlockOperation::LockExclusive)? {
+                LockAttempt::Acquired(file) => {
+                    tracing::info!("Locked {path:?}");
+                    return Ok(Self { path, file });
+                }
+                LockAttempt::StaleRetry => continue,
+                // `LockExclusive` blocks until acquired, so this is impossible.
+                LockAttempt::WouldBlock => unreachable!(),
+            }
+        }
+    }
+
+    /// Try to acquire the lock without blocking.
+    ///
+    /// Returns `Ok(Some(_))` if the lock was acquired, `Ok(None)` if another
+    /// holder currently owns it, and `Err(_)` for IO errors that aren't
+    /// "would block".
+    pub fn try_lock(path: PathBuf) -> Result<Option<Self>, FileLockError> {
+        tracing::info!("Attempting to try-lock {path:?}");
+        loop {
+            match Self::lock_attempt(&path, FlockOperation::NonBlockingLockExclusive)? {
+                LockAttempt::Acquired(file) => {
+                    tracing::info!("Try-locked {path:?}");
+                    return Ok(Some(Self { path, file }));
+                }
+                LockAttempt::WouldBlock => return Ok(None),
+                // The stale/unlinked case is a race with another holder's
+                // `Drop`; retry once to either acquire cleanly or observe a
+                // `WouldBlock` from a fresh contender.
+                LockAttempt::StaleRetry => continue,
+            }
+        }
+    }
+
+    fn lock_attempt(path: &PathBuf, op: FlockOperation) -> Result<LockAttempt, FileLockError> {
+        // Create lockfile, or open pre-existing one
+        let file = File::create(path).map_err(|err| FileLockError {
+            message: "Failed to open lock file",
+            path: path.clone(),
+            err,
+        })?;
+        match rustix::fs::flock(&file, op) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(LockAttempt::WouldBlock),
+            Err(errno) => {
+                return Err(FileLockError {
                     message: "Failed to lock lock file",
                     path: path.clone(),
                     err: errno.into(),
-                }
-            })?;
+                });
+            }
+        }
 
-            match rustix::fs::fstat(&file) {
-                Ok(stat) => {
-                    if stat.st_nlink == 0 {
-                        // Lockfile was deleted, probably by the previous holder's `Drop` impl;
-                        // create a new one so our ownership is visible,
-                        // rather than hidden in an unlinked file. Not
-                        // always necessary, since the previous holder might
-                        // have exited abruptly.
-                        continue;
-                    }
-                }
-                Err(rustix::io::Errno::STALE) => {
-                    // The file handle is stale.
-                    // This can happen when using NFS,
-                    // likely caused by a remote deletion of the lockfile.
-                    // Treat this like a normal lockfile deletion and retry.
-                    continue;
-                }
-                Err(errno) => {
-                    return Err(FileLockError {
-                        message: "failed to stat lock file",
-                        path: path.clone(),
-                        err: errno.into(),
-                    });
+        match rustix::fs::fstat(&file) {
+            Ok(stat) => {
+                if stat.st_nlink == 0 {
+                    // Lockfile was deleted, probably by the previous holder's `Drop` impl;
+                    // create a new one so our ownership is visible,
+                    // rather than hidden in an unlinked file. Not
+                    // always necessary, since the previous holder might
+                    // have exited abruptly.
+                    return Ok(LockAttempt::StaleRetry);
                 }
             }
-
-            tracing::info!("Locked {path:?}");
-            return Ok(Self { path, file });
+            Err(rustix::io::Errno::STALE) => {
+                // The file handle is stale.
+                // This can happen when using NFS,
+                // likely caused by a remote deletion of the lockfile.
+                // Treat this like a normal lockfile deletion and retry.
+                return Ok(LockAttempt::StaleRetry);
+            }
+            Err(errno) => {
+                return Err(FileLockError {
+                    message: "failed to stat lock file",
+                    path: path.clone(),
+                    err: errno.into(),
+                });
+            }
         }
+
+        Ok(LockAttempt::Acquired(file))
     }
+}
+
+enum LockAttempt {
+    Acquired(File),
+    WouldBlock,
+    StaleRetry,
 }
 
 impl Drop for FileLock {
