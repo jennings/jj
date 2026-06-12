@@ -1062,6 +1062,107 @@ fn test_run_pool_failed_command_does_not_poison_slot() {
     );
 }
 
+/// `--clean` wipes each slot before running the command so untracked artifacts
+/// left by a previous run do not survive into the next run's working copy.
+#[test]
+fn test_run_clean_wipes_slot() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("seed.txt", "seed");
+    work_dir.run_jj(&["commit", "-m", "seed"]).success();
+
+    // Prime slot 1 with a leftover untracked file to simulate a build artifact.
+    let slot_wc = work_dir.root().join(".jj/run/default/1/working_copy");
+    work_dir
+        .run_jj(&["run", "--config", "run.jobs=1", "-r", "@-", "--", "true"])
+        .success();
+    assert!(slot_wc.exists(), "slot 1 should exist after first run");
+    std::fs::write(slot_wc.join("leftover.txt"), "artifact").unwrap();
+
+    // Without --clean the leftover file is visible to the command (tracked via
+    // auto-tracking). Confirm by running a command that echoes its presence.
+    let jj_args_no_clean: &[&str] = if cfg!(windows) {
+        &[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "cmd",
+            "/c",
+            "if exist leftover.txt (echo PRESENT > saw_it.txt)",
+        ]
+    } else {
+        &[
+            "run",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "sh",
+            "-c",
+            "[ -e leftover.txt ] && echo PRESENT > saw_it.txt || true",
+        ]
+    };
+    work_dir.run_jj(jj_args_no_clean).success();
+    let files_no_clean = work_dir
+        .run_jj(&["file", "list", "-r", "@-"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        files_no_clean.contains("saw_it.txt") || files_no_clean.contains("leftover.txt"),
+        "expected leftover.txt to be visible without --clean; got:\n{files_no_clean}",
+    );
+
+    // With --clean, the slot is wiped before checkout. leftover.txt vanishes.
+    work_dir.run_jj(&["undo"]).success();
+    std::fs::write(slot_wc.join("leftover.txt"), "artifact").unwrap();
+
+    let jj_args_clean: &[&str] = if cfg!(windows) {
+        &[
+            "run",
+            "--clean",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "cmd",
+            "/c",
+            "if exist leftover.txt (echo PRESENT > saw_it.txt)",
+        ]
+    } else {
+        &[
+            "run",
+            "--clean",
+            "--config",
+            "run.jobs=1",
+            "-r",
+            "@-",
+            "--",
+            "sh",
+            "-c",
+            "[ -e leftover.txt ] && echo PRESENT > saw_it.txt || true",
+        ]
+    };
+    work_dir.run_jj(jj_args_clean).success();
+
+    let files_clean = work_dir
+        .run_jj(&["file", "list", "-r", "@-"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        !files_clean.contains("saw_it.txt") && !files_clean.contains("leftover.txt"),
+        "expected leftover.txt to be absent with --clean; got:\n{files_clean}",
+    );
+}
+
 fn get_log_output(work_dir: &TestWorkDir) -> String {
     work_dir
         .run_jj(&["log", "-T", r#"change_id ++ description ++ "\n""#])
