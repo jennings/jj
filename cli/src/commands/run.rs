@@ -494,7 +494,8 @@ async fn rewrite_commit(
 /// Checks out each revision in an isolated working copy, runs the command, then
 /// amends the revision with the resulting working copy. By default, descendants
 /// are rebased on top of the amended revisions, propagating the diff. Use
-/// `--restore-descendants` to keep descendants' content unchanged instead.
+/// `--restore-descendants` to keep descendants' content unchanged instead, or
+/// `--no-amend` to run the command without rewriting any commits.
 ///
 /// The command is executed with the following environment variables set:
 ///
@@ -553,6 +554,16 @@ pub struct RunArgs {
     /// Preserve the content (not the diff) when rebasing descendants
     #[arg(long)]
     restore_descendants: bool,
+
+    /// Run the command without rewriting any commits.
+    ///
+    /// Each revision is still checked out and the command still executes, but
+    /// the result is discarded instead of being amended back. Useful for
+    /// read-only checks (tests, linters) across a stack.
+    ///
+    /// Permitted on immutable commits. Conflicts with `--restore-descendants`.
+    #[arg(long, conflicts_with = "restore_descendants")]
+    no_amend: bool,
 
     /// Continue running on remaining revisions when a command exits nonzero
     ///
@@ -616,9 +627,11 @@ pub async fn cmd_run(
             .await?
     };
 
-    workspace_command
-        .check_rewritable(resolved_commits.iter().ids())
-        .await?;
+    if !args.no_amend {
+        workspace_command
+            .check_rewritable(resolved_commits.iter().ids())
+            .await?;
+    }
 
     let jobs = resolve_jobs(&workspace_command, args.jobs)?;
 
@@ -721,6 +734,7 @@ pub async fn cmd_run(
                     }
                     if res.dirty
                         && let Some(new_tree) = res.new_tree
+                        && !args.no_amend
                     {
                         done_commits.insert(res.old_id.clone());
                         rewritten_commits.insert(res.old_id.clone(), (res.old_tree, new_tree));
@@ -737,7 +751,22 @@ pub async fn cmd_run(
 
     // The operation was a no-op, bail.
     if rewritten_commits.is_empty() {
-        if !failed_commits.is_empty() {
+        if args.no_amend {
+            writeln!(
+                ui.stderr(),
+                "Ran command on {visited} revisions. No commits were modified (--no-amend).",
+            )?;
+            if !failed_commits.is_empty() {
+                writeln!(
+                    ui.stderr(),
+                    "run: {} commit(s) failed:",
+                    failed_commits.len()
+                )?;
+                for id in &failed_commits {
+                    writeln!(ui.stderr(), "  - {}", id.hex())?;
+                }
+            }
+        } else if !failed_commits.is_empty() {
             writeln!(
                 ui.stderr(),
                 "No commits were rewritten ({} command failure(s) with --keep-going)",
