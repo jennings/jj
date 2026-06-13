@@ -450,6 +450,98 @@ fn test_run_failure_rewrites_nothing() {
 }
 
 #[test]
+fn test_run_keep_going_rewrites_successes() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_commit_with_files(&work_dir, "a", &[], &[("a.txt", "a")]);
+    create_commit_with_files(&work_dir, "b", &["a"], &[("b.txt", "b")]);
+    create_commit_with_files(&work_dir, "c", &["b"], &[("c.txt", "c")]);
+
+    // Fail on B; succeed on A. With --keep-going, A must still be rewritten
+    // while B is left unchanged.
+    let cmd = "if [ \"$JJ_CHANGE_ID\" = 'rlvkpnrzqnoowoytxnquwvuryrwnrmlp' ]; then exit 1; fi; \
+               touch ran.txt";
+    let output = work_dir.run_jj(&[
+        "run",
+        "--keep-going",
+        "--config",
+        "run.jobs=1",
+        "-r",
+        "..@-",
+        "--",
+        "sh",
+        "-c",
+        cmd,
+    ]);
+    assert!(
+        output.status.success(),
+        "`jj run --keep-going` should exit 0 on partial failure; stderr:\n{}",
+        output.stderr
+    );
+
+    // A was rewritten and now carries ran.txt.
+    insta::assert_snapshot!(
+        work_dir.run_jj(&["file", "list", "-r", "@--"]),
+        @r"
+    a.txt
+    [EOF]
+    "
+    );
+    // B's own diff still only introduces b.txt: the failed command was not
+    // applied to B's tree.
+    let diff_b = work_dir
+        .run_jj(&["diff", "-r", "@-"])
+        .success()
+        .stdout
+        .to_string();
+    assert!(
+        !diff_b.contains("ran.txt"),
+        "B's diff should not contain ran.txt; got:\n{diff_b}"
+    );
+}
+
+#[test]
+fn test_run_keep_going_all_fail() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let fake_formatter = assert_cmd::cargo::cargo_bin("fake-formatter");
+    assert!(fake_formatter.is_file());
+    let fake_formatter_path = fake_formatter.to_string_lossy().into_owned();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("A.txt", "A");
+    work_dir.run_jj(&["commit", "-m", "A"]).success();
+
+    let log_before = get_log_output(&work_dir);
+
+    let output = work_dir.run_jj(&[
+        "run",
+        "--keep-going",
+        "--config",
+        "run.jobs=1",
+        "-r",
+        "@-",
+        "--",
+        &fake_formatter_path,
+        "--fail",
+    ]);
+    assert!(
+        output.status.success(),
+        "`jj run --keep-going` should exit 0 even when all commands fail; stderr:\n{}",
+        output.stderr
+    );
+
+    let stderr = output.stderr.to_string();
+    assert!(
+        stderr.contains("No commits were rewritten (1 command failure(s) with --keep-going)"),
+        "expected failure summary in stderr; got:\n{stderr}"
+    );
+
+    // Log is unchanged: no commits were rewritten.
+    assert_eq!(get_log_output(&work_dir), log_before);
+}
+
+#[test]
 fn test_run_recovers_after_failure() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();

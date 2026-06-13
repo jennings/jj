@@ -553,6 +553,14 @@ pub struct RunArgs {
     /// Preserve the content (not the diff) when rebasing descendants
     #[arg(long)]
     restore_descendants: bool,
+
+    /// Continue running on remaining revisions when a command exits nonzero
+    ///
+    /// The commit whose command failed is left unchanged. Already-running jobs
+    /// on other commits are not aborted. Successful rewrites are applied
+    /// atomically at the end.
+    #[arg(long, short = 'k')]
+    keep_going: bool,
 }
 
 /// Precedence: `--jobs`, `run.jobs` config, 1.
@@ -659,6 +667,7 @@ pub async fn cmd_run(
         subdir,
     });
     let mut rewritten_commits = HashMap::new();
+    let failed_commits: Vec<CommitId> = Vec::new();
 
     // Drive the producer (run_inner) and consumer (receive loop) concurrently
     // so that each subprocess's output is emitted as soon as it finishes rather
@@ -701,7 +710,7 @@ pub async fn cmd_run(
                             let mut err = ui.stderr();
                             err.write_all(&res.stderr)?;
                         }
-                        if !status.success() {
+                        if !status.success() && !args.keep_going {
                             return Err(RunError::CommandFailure(
                                 spec.to_string(),
                                 status,
@@ -728,10 +737,18 @@ pub async fn cmd_run(
 
     // The operation was a no-op, bail.
     if rewritten_commits.is_empty() {
-        writeln!(
-            ui.stderr(),
-            "No commits were rewritten as the command did not modify any tracked files"
-        )?;
+        if !failed_commits.is_empty() {
+            writeln!(
+                ui.stderr(),
+                "No commits were rewritten ({} command failure(s) with --keep-going)",
+                failed_commits.len()
+            )?;
+        } else {
+            writeln!(
+                ui.stderr(),
+                "No commits were rewritten as the command did not modify any tracked files"
+            )?;
+        }
         tx.finish(ui, format!("run: No-op on {visited} commits with {spec}"))
             .await?;
         return Ok(());
@@ -793,6 +810,17 @@ pub async fn cmd_run(
     }
     tx.finish(ui, format!("run: rewrite {count} commits with {spec}"))
         .await?;
+
+    if !failed_commits.is_empty() {
+        writeln!(
+            ui.stderr(),
+            "run: {} commit(s) failed (not rewritten):",
+            failed_commits.len()
+        )?;
+        for id in &failed_commits {
+            writeln!(ui.stderr(), "  - {}", id.hex())?;
+        }
+    }
 
     Ok(())
 }
