@@ -622,6 +622,51 @@ fn test_run_sets_workspace_root_env_var() {
     );
 }
 
+#[test]
+fn test_run_failure_shows_output() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let fake_formatter = assert_cmd::cargo::cargo_bin("fake-formatter");
+    assert!(fake_formatter.is_file());
+    let fake_formatter_path = fake_formatter.to_string_lossy().into_owned();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("A.txt", "A");
+    work_dir.run_jj(&["commit", "-m", "A"]).success();
+
+    let output = work_dir.run_jj(&[
+        "run",
+        "-r",
+        "@-",
+        "--",
+        &fake_formatter_path,
+        "--stdout",
+        "hello stdout",
+        "--stderr",
+        "hello stderr",
+        "--fail",
+    ]);
+    assert!(!output.status.success());
+
+    // The process's stdout should be forwarded before jj exits.
+    assert!(
+        output.stdout.raw().contains("hello stdout"),
+        "stdout should contain the process's output"
+    );
+
+    // The process's stderr should appear before jj's own error message.
+    let stderr = output.stderr.raw();
+    let process_pos = stderr
+        .find("hello stderr")
+        .expect("stderr should contain the process's stderr output");
+    let jj_error_pos = stderr
+        .find("the command")
+        .expect("stderr should contain jj's error message");
+    assert!(
+        process_pos < jj_error_pos,
+        "process stderr ({process_pos}) should precede jj's error message ({jj_error_pos})"
+    );
+}
+
 fn get_log_output(work_dir: &TestWorkDir) -> String {
     work_dir
         .run_jj(&["log", "-T", r#"change_id ++ description ++ "\n""#])
