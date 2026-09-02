@@ -27,7 +27,7 @@ Producing the list of contributors is a bit annoying. The current suggestion is
 to run something like this:
 
 ```shell
-root=$(jj log -G -r 'heads(tags(glob:"v*.*.*") & ::trunk())' -T commit_id)
+root=$(jj log -G -r 'heads(v0.44.0@upstream & ::trunk())' -T commit_id)
 filter='
 map(.commits[] | select(.author.login | (. != null and endswith("[bot]") | not)))
   | unique_by(if .author.login != null then .author.login else .author.email end)
