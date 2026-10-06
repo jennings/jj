@@ -6,146 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Release highlights
-
-### Breaking changes
-
-* In non-colocated workspaces, `jj git fetch` and `push` no longer update
-  remote-tracking Git refs. Use `jj git export` to export remote bookmarks to
-  Git.
-
-* In non-colocated workspaces, `jj git import; jj undo; jj git import` no longer
-  re-imports external changes. Run `jj git export` to reflect undone changes in
-  Git. `jj git fetch; jj undo; jj git fetch` continues to work as expected.
-
-* `Timestamp.format()` now follows [jiff's strftime
-  syntax](https://docs.rs/jiff/latest/jiff/fmt/strtime/index.html) instead of
-  chrono's. Most directives, including the default format, are unchanged, but:
-  * `%v` and `%+` are no longer supported. Use `%e-%b-%Y` and
-    `%Y-%m-%dT%H:%M:%S%.3f%:z` (which always includes milliseconds) instead.
-  * `%c`, `%x`, and `%r` produce different output. For example, `%x` now
-    formats as `2001 M07 8` rather than `07/08/01`.
-  * `%f` now prints only as many digits as needed rather than always 9. Use
-    `%9f` or `%N` for the old behavior. Similarly, `%.f` no longer pads to 3, 6,
-    or 9 digits, so it formats as `.12` rather than `.120`.
-  * `%Z` now prints a time zone abbreviation. Use `%:z` to get an offset.
-  * `%:::z` now includes the minutes of an offset when they are non-zero.
-  * New directives and flags such as `%N`, `%Q`, `%^a`, and `%5Y` are now
-    accepted. `%#z` no longer panics.
-  * `json(timestamp)` now prints a UTC time zone offset as `+00:00` instead of
-    `Z`.
-
-* The bookmarks and tags list now include absent targets for conflicted
-  bookmarks and tags. The `.removed_targets()` and `.added_targets()` template
-  methods now return `List<Option<Commit>>`.
-
-### Deprecations
-
-### New features
-
-* `jj git push` with `git.sign-on-push` enabled now signs commits in a
-  separate transaction before the push, so commits stay signed if the push
-  fails and a new push doesn't have to sign them again.
-
-* Diff hunk headers now include symbol context even for unsupported languages.
-
-* `jj resolve` gained a built-in `:editor` merge tool that opens the conflicted
-  file with conflict markers in your text editor. Unlike the other merge tools,
-  it supports conflicts with more than two sides.
-
-* `Commit.contained_in()` now accepts a `Stringify` instead of a `StringLiteral`.
-  This enables dynamic query building during templating.
-
-* Templates now have a top-level `revset(revset: Stringify) -> List<Commit>`
-  function for evaluating revsets during templating.
-
-* `jj config gc` now also cleans up workspace configs whose paths no longer
-  exist.
-
-* The `TreeEntry` template type now has `.removed_values() -> List<Option<TreeValue>>`
-  and `.added_values() -> List<Option<TreeValue>>` methods, and `TreeValue` now
-  exposes `.object_id()`, `.file_type()`, and `.executable()` methods for
-  inspecting each side of a (possibly conflicted) tree entry.
-
-* The `WorkspaceRef` template type now has a `.current_workspace() -> Boolean`
-  method, which can be used to identify the current workspace. This is slightly
-  different than `self.target().current_working_copy()` because multiple
-  workspaces can point to the same commit.
-
-* `jj next`/`jj prev` now accept a change ID prefix when prompting for the
-  target commit. The special `q` quit choice was removed; cancel with EOF.
-  [#9790](https://github.com/jj-vcs/jj/issues/9790)
-
-* `jj converge` now accepts a change ID prefix when prompting for the change
-  to converge. The special `q` abort choice was removed; canceling with EOF now
-  exits with an error (previously `q` aborted successfully).
-
-### Fixed bugs
-
-* In graph output, an elided edge that passes through a merge or fork line is
-  now drawn as elided (`╷`) before reaching the node, instead of looking like a
-  direct edge. Consecutive unconnected nodes, such as in the `jj op show`
-  graph, are now separated by a blank line so they don't look connected.
-
-* The operations created by `jj workspace add` are now attributed to the
-  workspace the command was run in, so `jj undo` there undoes them instead of
-  refusing to undo an operation from another workspace.
-
-* Date patterns such as `after:"2024-03-10 03:30"` are now resolved with the
-  correct UTC offset on days with a daylight savings transition. Previously,
-  the offset from the start of the day was used, so times after were off
-  by an hour. Likely a niche bug fix, but a bug fix nonetheless!
-
-* Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
-  `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
-
-* `jj git fetch` no longer creates additional refs based on non-standard Git
-  `remote.<name>.fetch` configuration.
-
-* Fixed tag deletion with `jj git fetch --tag=NAME`.
-
-* `jj workspace remove` can now remove stale workspaces.
-  [#10276](https://github.com/jj-vcs/jj/issues/10276)
-
-* Fixed issue with `config-schema.json` where Taplo (TOML parsing library) would
-  flag any `aliases` defined as a table but without an explicit
-  `.enabled = true` as "valid under more than one of the schemas". This affected
-  downstream tools such as editor extensions showing errors in perfectly valid
-  config files.
-
-* Fix a race condition in colocated workspaces where concurrent `jj git fetch`
-  and `jj` commands could import partially fetched refs, causing divergence.
-  [#7349](https://github.com/jj-vcs/jj/issues/7349)
-
-* In colocated workspaces, Git export failures are no longer misidentified as
-  external changes. Those changes are now re-exported on the next `jj`
-  invocation. [#10478](https://github.com/jj-vcs/jj/issues/10478)
-
-* `jj run` now materializes conflicts using `ui.conflict-marker-style` instead
-  of always using the `snapshot` style.
-  [#10390](https://github.com/jj-vcs/jj/issues/10390)
-
-* Deeply nested revset, fileset, and template expressions are now rejected
-  instead of causing a crash.
-  [#10071](https://github.com/jj-vcs/jj/issues/10071)
-
-* The Git backend now leaves out the root commit as a parent of a merge commit
-  instead of failing. This fixes abandoning a child of the root commit that is a
-  parent of a merge commit, including when a Git import abandons it.
-  [#8076](https://github.com/jj-vcs/jj/issues/8076)
-
-* On Unix, repository files under `.jj` are now created with default file
-  permissions.
-
-* Racy `jj config set` invocations no longer corrupt the target file. The last
-  save wins; changes from other concurrent invocations may be lost.
-  [#10350](https://github.com/jj-vcs/jj/issues/10350)
-
-* `jj log` no longer draws a commit as a merge with two elided edges to the
-  same commit when there's a merge between them whose parents both lead to
-  that commit.
+<!-- BEGIN UNRELEASED NOTE -->
+Changes that have not been released yet are described in the
+[`changelog/`](https://github.com/jj-vcs/jj/tree/main/changelog) directory.
+<!-- END UNRELEASED NOTE -->
 
 ## [0.46.0] - 2026-10-07
 
@@ -5879,7 +5743,6 @@ No changes, only trying to get the automated build to work.
 
 Last release before this changelog started.
 
-[unreleased]: https://github.com/jj-vcs/jj/compare/v0.46.0...HEAD
 [0.46.0]: https://github.com/jj-vcs/jj/compare/v0.45.1...v0.46.0
 [0.45.1]: https://github.com/jj-vcs/jj/compare/v0.45.0...v0.45.1
 [0.45.0]: https://github.com/jj-vcs/jj/compare/v0.44.0...v0.45.0
