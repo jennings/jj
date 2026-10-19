@@ -16,6 +16,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New features
 
+* Aliases can now be defined under existing commands that have subcommands,
+  e.g. `aliases."bookmark mine" = ["list", "-r", "mine()"]` makes
+  `jj bookmark mine` run `jj bookmark list -r 'mine()'`.
+
 ### Fixed bugs
 
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,

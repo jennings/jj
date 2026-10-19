@@ -1092,6 +1092,30 @@ echo "args: $@"
 > Note: Shebangs (e.g. `#!/usr/bin/env`) aren't necessary since you're already
 > explicitly passing your script into the right shell.
 
+### Subcommand aliases
+
+An alias can also be defined under an existing command that has subcommands,
+such as `jj bookmark` or `jj git remote`. Quote the alias name and separate the
+command path from the new subcommand name with spaces. The definition is
+interpreted relative to the parent command, i.e. it replaces only the last
+word:
+
+```toml
+[aliases]
+# `jj bookmark mine` runs `jj bookmark list -r 'mine()'`
+"bookmark mine" = ["list", "-r", "mine()"]
+# `jj git remote ls` runs `jj git remote list`
+"git remote ls" = ["list"]
+# The table form works too
+"op last" = { definition = ["log", "-n1"], doc = "Show the last operation" }
+```
+
+The command path must name built-in commands (either canonical names or their
+built-in aliases, such as `op` for `operation`); it cannot start with another
+user-defined alias. However, an alias like `b = ["bookmark"]` still expands
+before subcommand aliases are resolved, so `jj b mine` works as well. As with
+top-level aliases, a subcommand alias cannot override an existing subcommand.
+
 ### Disabling aliases
 
 Sometimes you may want to disable an alias, such as a built-in alias that you

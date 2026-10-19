@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::io::BufRead as _;
+use std::iter;
 use std::path::Path;
 
 use clap::FromArgMatches as _;
@@ -312,21 +313,42 @@ pub fn template_aliases() -> Vec<CompletionCandidate> {
 }
 
 pub fn aliases() -> Vec<CompletionCandidate> {
+    alias_candidates(&[])
+}
+
+/// Returns a completer for the aliases defined under a subcommand, such as
+/// `aliases."bookmark foo"`. Each element of `parent` lists the names
+/// (including clap aliases) accepted for the command at that level.
+pub fn subcommand_aliases(
+    parent: Vec<Vec<String>>,
+) -> impl Fn() -> Vec<CompletionCandidate> + Send + Sync {
+    move || alias_candidates(&parent)
+}
+
+fn alias_candidates(parent: &[Vec<String>]) -> Vec<CompletionCandidate> {
     with_jj(|_, settings| {
         Ok(settings
             .table_keys("aliases")
+            .filter_map(|alias| {
+                let words = alias.split_whitespace().collect_vec();
+                let (name, parent_words) = words.split_last()?;
+                let matches_parent = parent_words.len() == parent.len()
+                    && iter::zip(parent_words, parent)
+                        .all(|(word, names)| names.iter().any(|n| n == word));
+                matches_parent.then_some((alias, *name))
+            })
             // This is opinionated, but many people probably have several
             // single- or two-letter aliases they use all the time. These
             // aliases don't need to be completed and they would only clutter
             // the output of `jj <TAB>`.
-            .filter(|alias| alias.len() > 2)
-            .filter(|alias| {
+            .filter(|(_, name)| !parent.is_empty() || name.len() > 2)
+            .filter(|(alias, _)| {
                 settings
                     .get_bool(["aliases", alias, "enabled"])
                     .unwrap_or(true)
             })
-            .map(|alias| {
-                CompletionCandidate::new(alias).help(
+            .map(|(alias, name)| {
+                CompletionCandidate::new(name).help(
                     settings
                         .get_string(["aliases", alias, "doc"])
                         .ok()

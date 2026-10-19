@@ -892,6 +892,47 @@ fn test_remote_names() {
     ");
 }
 
+#[test]
+fn test_subcommand_aliases_are_completed() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    test_env.add_config(
+        r#"[aliases]
+    "bookmark fancy" = { definition = ["list"], doc = "Fancy list" }
+    "bookmark f" = ["forget"]
+    "operation lg" = ["log"]
+    top-level = ["log"]
+    "#,
+    );
+
+    // Subcommand aliases are completed under their parent, including short ones
+    let output = work_dir.complete_fish(["bookmark", "f"]);
+    insta::assert_snapshot!(output, @"
+    f
+    fancy	Fancy list
+    forget	Forget a bookmark without marking it as a deletion to be pushed
+    [EOF]
+    ");
+
+    // Parent can be spelled with a built-in alias
+    let output = work_dir.complete_fish(["op", "l"]);
+    insta::assert_snapshot!(output, @"
+    lg
+    log	Show the operation log
+    [EOF]
+    ");
+
+    // Subcommand aliases are not completed at the top level
+    let output = work_dir.complete_fish(["f"]);
+    insta::assert_snapshot!(output, @"
+    file	File operations
+    fix	Update files with formatting fixes or other changes
+    [EOF]
+    ");
+}
+
 #[test_case(Shell::Bash; "bash")]
 #[test_case(Shell::Zsh; "zsh")]
 #[test_case(Shell::Fish; "fish")]

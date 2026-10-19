@@ -669,3 +669,97 @@ fn test_alias_falls_back_to_default_command() {
     [EOF]
     ");
 }
+
+#[test]
+fn test_subcommand_alias() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "my-bookmark"])
+        .success();
+
+    test_env.add_config(
+        r#"[aliases]
+    "bookmark names" = ["list", "-T", "name ++ '\n'"]
+    "bookmark  nested-names" = { definition = ["names"], doc = "Names" }
+    "op last" = ["log", "--no-graph", "-n1", "-T", "description ++ '\n'"]
+    "git remote ls" = ["list"]
+    bm = ["bookmark"]
+    "#,
+    );
+
+    // Alias under a subcommand, with global args before and after it
+    let output = work_dir.run_jj(["--no-pager", "bookmark", "names", "--quiet"]);
+    insta::assert_snapshot!(output, @"
+    my-bookmark
+    [EOF]
+    ");
+
+    // Aliases can expand to other subcommand aliases, and the parent command
+    // can itself be produced by an alias
+    let output = work_dir.run_jj(["bm", "nested-names"]);
+    insta::assert_snapshot!(output, @"
+    my-bookmark
+    [EOF]
+    ");
+
+    // The parent command path is matched by canonical name, so built-in
+    // command aliases ("op" for "operation") work on either side
+    let output = work_dir.run_jj(["operation", "last"]);
+    insta::assert_snapshot!(output, @"
+    create bookmark my-bookmark pointing to commit e8849ae12c709f2321908879bc724fdb2ab8a781
+    [EOF]
+    ");
+
+    // Aliases can be nested more than one level deep
+    work_dir
+        .run_jj(["git", "remote", "add", "origin", "http://example.com"])
+        .success();
+    let output = work_dir.run_jj(["git", "remote", "ls"]);
+    insta::assert_snapshot!(output, @"
+    origin http://example.com/
+    [EOF]
+    ");
+
+    // Unknown subcommands are still reported by clap
+    let output = work_dir.run_jj(["bookmark", "nope"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    error: unrecognized subcommand 'nope'
+
+    Usage: jj bookmark [OPTIONS] <COMMAND>
+
+    For more information, try '--help'.
+    [EOF]
+    [exit status: 2]
+    ");
+}
+
+#[test]
+fn test_subcommand_alias_invalid() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    test_env.add_config(
+        r#"[aliases]
+    "bookmark list" = ["create"]
+    "nonexistent foo" = ["log"]
+    "log foo" = ["-r", "@"]
+    "bookmark r1" = ["r2"]
+    "bookmark r2" = ["r1"]
+    "#,
+    );
+
+    let output = work_dir.run_jj(["bookmark", "r1"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Warning: Cannot define an alias that overrides the built-in command 'bookmark list'.
+    Warning: Cannot define alias `nonexistent foo`: `nonexistent` is not a subcommand of `jj`.
+    Warning: Cannot define alias `log foo`: `log` has no subcommands.
+    Error: Recursive alias definition involving `bookmark r1`
+    [EOF]
+    [exit status: 1]
+    ");
+}

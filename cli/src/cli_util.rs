@@ -17,13 +17,13 @@ use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Debug;
 use std::io;
 use std::io::Write as _;
+use std::iter;
 use std::mem;
 use std::ops::Range;
 use std::path::Path;
@@ -47,6 +47,7 @@ use clap::error::ContextKind;
 use clap::error::ContextValue;
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
+use clap_complete::engine::SubcommandCandidates;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::future::try_join_all;
@@ -4032,11 +4033,16 @@ fn resolve_default_command(
 }
 
 /// Loads alias definitions from the `aliases` table.
-fn load_aliases<'config>(
+///
+/// An alias name may consist of multiple whitespace-separated words, in which
+/// case the leading words name an existing (nested) subcommand and the last
+/// word is the alias defined under that subcommand. The returned map is keyed
+/// by the canonical names of the command path joined by a single space.
+fn load_aliases(
     ui: &Ui,
-    config: &'config StackedConfig,
+    config: &StackedConfig,
     app: &Command,
-) -> Result<HashMap<&'config str, Vec<String>>, CommandError> {
+) -> Result<HashMap<String, Vec<String>>, CommandError> {
     let mut defined_aliases = HashMap::new();
     for alias in config.table_keys("aliases") {
         if config
@@ -4053,10 +4059,8 @@ fn load_aliases<'config>(
                 Err(_) => Err(original_error),
             },
         };
-        match definition {
-            Ok(definition) => {
-                defined_aliases.insert(alias, definition);
-            }
+        let definition = match definition {
+            Ok(definition) => definition,
             Err(err) => {
                 writeln!(
                     ui.warning_default(),
@@ -4064,58 +4068,114 @@ fn load_aliases<'config>(
                      `definition`"
                 )?;
                 print_error_sources(ui, Some(&err))?;
+                continue;
             }
+        };
+        let words = alias.split_whitespace().collect_vec();
+        let Some((name, parent_words)) = words.split_last() else {
+            writeln!(
+                ui.warning_default(),
+                "Cannot define an alias with an empty name."
+            )?;
+            continue;
+        };
+        // Resolve the parent command path, normalizing clap aliases (such as
+        // "b" for "bookmark") to the canonical command names.
+        let mut parent = app;
+        let mut key_words = vec![];
+        for &word in parent_words {
+            let Some(cmd) = parent.find_subcommand(word) else {
+                writeln!(
+                    ui.warning_default(),
+                    "Cannot define alias `{alias}`: `{word}` is not a subcommand of `{}`.",
+                    parent.get_bin_name().unwrap_or(parent.get_name())
+                )?;
+                break;
+            };
+            parent = cmd;
+            key_words.push(parent.get_name());
         }
-    }
-    // Print warnings for aliases that match real commands and remove them from
-    // the mapping.
-    let mut real_commands = HashSet::new();
-    for command in app.get_subcommands() {
-        real_commands.insert(command.get_name());
-        for alias in command.get_all_aliases() {
-            real_commands.insert(alias);
+        if key_words.len() != parent_words.len() {
+            continue;
         }
-    }
-    for alias in defined_aliases
-        .extract_if(|a, _| real_commands.contains(*a))
-        .map(|(a, _)| a)
-        .sorted()
-    {
-        writeln!(
-            ui.warning_default(),
-            "Cannot define an alias that overrides the built-in command '{alias}'."
-        )?;
+        if !parent_words.is_empty() && !parent.has_subcommands() {
+            writeln!(
+                ui.warning_default(),
+                "Cannot define alias `{alias}`: `{}` has no subcommands.",
+                key_words.join(" ")
+            )?;
+            continue;
+        }
+        // Print warnings for aliases that match real commands.
+        if parent.find_subcommand(name).is_some() {
+            let full_name = key_words.iter().chain([name]).join(" ");
+            writeln!(
+                ui.warning_default(),
+                "Cannot define an alias that overrides the built-in command '{full_name}'."
+            )?;
+            continue;
+        }
+        key_words.push(name);
+        defined_aliases.insert(key_words.join(" "), definition);
     }
     Ok(defined_aliases)
 }
 
+/// Allows unknown subcommands at every level of the command tree that has
+/// subcommands, so that aliases nested under those commands can be detected.
+fn allow_external_subcommands_recursively(cmd: Command) -> Command {
+    if !cmd.has_subcommands() {
+        return cmd;
+    }
+    cmd.allow_external_subcommands(true)
+        .mut_subcommands(allow_external_subcommands_recursively)
+}
+
 fn resolve_aliases(
     app: &Command,
-    defined_aliases: &HashMap<&str, Vec<String>>,
+    defined_aliases: &HashMap<String, Vec<String>>,
     mut string_args: Vec<String>,
 ) -> Result<Vec<String>, CommandError> {
     let mut recursion_check_stack: Vec<(&str, Range<usize>)> = Vec::new();
+    let app = allow_external_subcommands_recursively(app.clone());
 
     loop {
-        let app_clone = app.clone().allow_external_subcommands(true);
-        let matches = app_clone.try_get_matches_from(&string_args).ok();
-        let Some((command_name, submatches)) = matches.as_ref().and_then(|m| m.subcommand()) else {
-            // No more alias commands, or hit unknown option
+        let Ok(matches) = app.clone().try_get_matches_from(&string_args) else {
+            // Hit unknown option
             return Ok(string_args);
         };
-        let alias_name = command_name.to_string();
-        let alias_args = submatches
-            .get_many::<OsString>("")
-            .unwrap_or_default()
-            .map(|arg| arg.to_str().unwrap().to_string())
-            .collect_vec();
-        let Some((&alias_name, alias_definition)) = defined_aliases.get_key_value(&*alias_name)
+        // Walk down the real subcommands until we find an external one, which
+        // may be an alias.
+        let mut cmd = &app;
+        let mut submatches = &matches;
+        let mut path = vec![];
+        let (command_name, alias_args) = loop {
+            let Some((command_name, next_matches)) = submatches.subcommand() else {
+                // No more alias commands
+                return Ok(string_args);
+            };
+            path.push(command_name);
+            if let Some(subcmd) = cmd.find_subcommand(command_name) {
+                cmd = subcmd;
+                submatches = next_matches;
+                continue;
+            }
+            let alias_args = next_matches
+                .get_many::<OsString>("")
+                .unwrap_or_default()
+                .map(|arg| arg.to_str().unwrap().to_string())
+                .collect_vec();
+            break (command_name, alias_args);
+        };
+        let Some((alias_name, alias_definition)) = defined_aliases.get_key_value(&path.join(" "))
         else {
             // Not a real command and not an alias, so return what we've
             // resolved so far.
             return Ok(string_args);
         };
+        let alias_name = alias_name.as_str();
         let alias_position = string_args.len() - 1 - alias_args.len();
+        assert_eq!(string_args[alias_position], command_name);
 
         // recursion check
         while let Some((_, check_range)) = recursion_check_stack.last() {
@@ -4261,6 +4321,7 @@ fn handle_shell_completion(
         hide_short_subcommand_aliases(&mut app);
         // for completing aliases
         app.allow_external_subcommands(true)
+            .mut_subcommands(|cmd| add_subcommand_alias_candidates(cmd, &[]))
     })
     .try_complete(args.iter(), Some(cwd))?;
     assert!(
@@ -4268,6 +4329,26 @@ fn handle_shell_completion(
         "This function should not be called without the COMPLETE variable set."
     );
     Ok(())
+}
+
+/// Adds completion candidates for aliases nested under `cmd` and its
+/// subcommands, such as `aliases."bookmark foo"`.
+fn add_subcommand_alias_candidates(cmd: Command, parent: &[Vec<String>]) -> Command {
+    if !cmd.has_subcommands() {
+        return cmd;
+    }
+    let mut path = parent.to_vec();
+    path.push(
+        iter::once(cmd.get_name())
+            .chain(cmd.get_all_aliases())
+            .map(|name| name.to_owned())
+            .collect(),
+    );
+    cmd.allow_external_subcommands(true)
+        .add(SubcommandCandidates::new(complete::subcommand_aliases(
+            path.clone(),
+        )))
+        .mut_subcommands(|cmd| add_subcommand_alias_candidates(cmd, &path))
 }
 
 /// Removes prefix command names (e.g. "c" for "create") from visible aliases,
